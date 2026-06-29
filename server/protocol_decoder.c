@@ -212,18 +212,18 @@ int protocol_decode(session_t *session, const uint8_t *buf, size_t len,
 
         if (zstd_len == 0) {
             LOG_ERROR("session %d empty data frame", session->fd);
-            goto frame_done;
+            goto decode_error;
         }
 
         /* Zstd 解压 */
         unsigned long long decomp_size = ZSTD_getFrameContentSize(zstd_data, zstd_len);
         if (decomp_size == ZSTD_CONTENTSIZE_ERROR || decomp_size == ZSTD_CONTENTSIZE_UNKNOWN) {
             LOG_ERROR("session %d Zstd content size error", session->fd);
-            goto frame_done;
+            goto decode_error;
         }
         if (decomp_size > BLOCK_SIZE_MAX + 4096) {
             LOG_ERROR("session %d decompressed size too large: %llu", session->fd, decomp_size);
-            goto frame_done;
+            goto decode_error;
         }
 
         size_t actual_size = ZSTD_decompress(out->data, decomp_size,
@@ -231,7 +231,7 @@ int protocol_decode(session_t *session, const uint8_t *buf, size_t len,
         if (ZSTD_isError(actual_size)) {
             LOG_ERROR("session %d Zstd decompress failed: %s",
                       session->fd, ZSTD_getErrorName(actual_size));
-            goto frame_done;
+            goto decode_error;
         }
 
         /* MsgPack 解码 — block_data 指向 data[] 内的子区间 */
@@ -241,7 +241,7 @@ int protocol_decode(session_t *session, const uint8_t *buf, size_t len,
                                  &out->devno, &out->offset,
                                  &block_ptr, &block_len) != 0) {
             LOG_ERROR("session %d MsgPack decode failed", session->fd);
-            goto frame_done;
+            goto decode_error;
         }
 
         /* 将 bin 数据移到 data[] 开头, 便于调用方使用 */
@@ -270,7 +270,7 @@ int protocol_decode(session_t *session, const uint8_t *buf, size_t len,
         } else {
             LOG_WARN("session %d unknown control frame (%u bytes): %.*s",
                      session->fd, frame_len, (int)MIN(frame_len, 64), frame_data);
-            goto frame_done;
+            goto decode_error;
         }
     }
 
@@ -284,6 +284,16 @@ frame_done:
     session->recv_len = remaining;
 
     return 1;  /* 成功解码一条消息 */
+
+decode_error:
+    /* 错误时也消费已处理的数据 */
+    remaining = session->recv_len - total_needed;
+    if (remaining > 0) {
+        memmove(session->recv_buf,
+                session->recv_buf + total_needed, remaining);
+    }
+    session->recv_len = remaining;
+    return -1;
 }
 
 const char *decode_error_string(int err) {

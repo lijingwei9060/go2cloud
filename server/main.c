@@ -206,7 +206,14 @@ static socket_t server_listen(server_config_t *cfg) {
 /* Handle data on an established connection */
 static void handle_session(session_t *s) {
     uint8_t tmp_buf[65536];
-    decoded_msg_t msg;
+
+    /* Heap-allocated: struct contains 1MB+ data buffer, too large for stack */
+    decoded_msg_t *msg = calloc(1, sizeof(decoded_msg_t));
+    if (!msg) {
+        LOG_ERROR("session %d out of memory for decode buffer", s->fd);
+        session_remove(s->fd);
+        return;
+    }
 
     while (1) {
 #ifdef _WIN32
@@ -216,16 +223,18 @@ static void handle_session(session_t *s) {
 #endif
         if (n < 0) {
 #ifdef _WIN32
-            if (WSAGetLastError() == WSAEWOULDBLOCK) return;
+            if (WSAGetLastError() == WSAEWOULDBLOCK) { free(msg); return; }
 #else
-            if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) { free(msg); return; }
 #endif
             LOG_ERROR("recv(session %d) error: %d", s->fd, (int)SOCKET_ERRNO);
+            free(msg);
             session_remove(s->fd);
             return;
         }
         if (n == 0) {
             LOG_INFO("session %d closed by peer", s->fd);
+            free(msg);
             session_remove(s->fd);
             return;
         }
@@ -234,9 +243,10 @@ static void handle_session(session_t *s) {
         size_t consumed = 0;
         const uint8_t *ptr = tmp_buf;
         while (consumed < (size_t)n) {
-            int rc = protocol_decode(s, ptr, (size_t)n - consumed, &msg);
+            int rc = protocol_decode(s, ptr, (size_t)n - consumed, msg);
             if (rc < 0) {
                 LOG_ERROR("session %d protocol error", s->fd);
+                free(msg);
                 session_remove(s->fd);
                 return;
             }
@@ -246,11 +256,11 @@ static void handle_session(session_t *s) {
             session_touch(s);
 
             /* Process decoded result */
-            switch (msg.type) {
+            switch (msg->type) {
             case DECODE_DATA_BLOCK:
-                if (block_writer_write(msg.devno, msg.offset,
-                                       msg.data, msg.data_len) == 0) {
-                    ack_send_block(s->fd, msg.devno, msg.data_len, msg.offset);
+                if (block_writer_write(msg->devno, msg->offset,
+                                       msg->data, msg->data_len) == 0) {
+                    ack_send_block(s->fd, msg->devno, msg->data_len, msg->offset);
                 }
                 break;
 
@@ -267,7 +277,7 @@ static void handle_session(session_t *s) {
                 break;
 
             default:
-                LOG_WARN("session %d unknown decode result %d", s->fd, msg.type);
+                LOG_WARN("session %d unknown decode result %d", s->fd, msg->type);
                 break;
             }
 
