@@ -56,6 +56,13 @@ echo [OK] client.exe built
 :end
 echo.
 echo ============================================
+echo Copying runtime DLLs...
+echo ============================================
+if exist "%VCPKG%\bin\zstd.dll"   copy /y "%VCPKG%\bin\zstd.dll"   . >nul && echo [OK] zstd.dll copied
+if exist "%VCPKG%\bin\sqlite3.dll" copy /y "%VCPKG%\bin\sqlite3.dll" . >nul && echo [OK] sqlite3.dll copied
+
+echo.
+echo ============================================
 echo Results:
 echo ============================================
 if exist receiver.exe (echo   receiver.exe - OK) else (echo   receiver.exe - MISSING)
