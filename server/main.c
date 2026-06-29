@@ -373,8 +373,8 @@ int main(int argc, char *argv[]) {
     /* Read config file */
     char *config_json = read_file_all(config_path);
     if (!config_json) {
-        fprintf(stderr, "Cannot read config file: %s\n", config_path);
-        fprintf(stderr, "Using defaults: listen 0.0.0.0:3389, target /tmp/receiver_disk0.img\n");
+        printf("Cannot read config file: %s\n", config_path);
+        printf("Using defaults: listen 0.0.0.0:3389, target /tmp/receiver_disk0.img\n");
     }
 
     /* Parse log config */
@@ -389,6 +389,10 @@ int main(int argc, char *argv[]) {
     }
     log_init(log_level, log_path[0] ? log_path : NULL);
 
+    if (log_path[0]) {
+        printf("Log file: %s\n", log_path);
+    }
+    printf("go2cloud receiver starting...\n");
     LOG_INFO("go2cloud receiver starting...");
 
     /* Parse listen config */
@@ -447,16 +451,19 @@ int main(int argc, char *argv[]) {
 
     /* If no disks registered, use default */
     if (block_writer_total_blocks() == 0 && block_writer_total_bytes() == 0) {
+        printf("No target disks configured, using default: /tmp/receiver_disk0.img\n");
         block_writer_register(0, "/tmp/receiver_disk0.img");
     }
 
     /* Open target disks */
     if (block_writer_open_all() < 0) {
+        fprintf(stderr, "ERROR: Failed to open target disks\n");
         LOG_ERROR("Failed to open target disks");
         free(config_json);
         return 1;
     }
 
+    printf("Target disks opened successfully\n");
     LOG_INFO("Target disks opened successfully");
 
     /* Create listen socket */
@@ -472,6 +479,8 @@ int main(int argc, char *argv[]) {
     signal(SIGTERM, signal_handler);
 
     /* Main loop */
+    printf("Listening on %s:%d (max %d connections)\n",
+           srv_cfg.address, srv_cfg.port, srv_cfg.max_connections);
     LOG_INFO("Receiver ready, waiting for connections...");
     server_run(listen_fd, &srv_cfg);
 
