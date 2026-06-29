@@ -58,13 +58,13 @@ int volume_enumerate(volume_list_t *list) {
         }
 
         /* 获取设备编号 (用于与配置匹配) */
+        int32_t devno = (int32_t)n;
         STORAGE_DEVICE_NUMBER dev_num;
         memset(&dev_num, 0, sizeof(dev_num));
         if (DeviceIoControl(h, IOCTL_STORAGE_GET_DEVICE_NUMBER,
                             NULL, 0, &dev_num, sizeof(dev_num),
                             &bytes_returned, NULL)) {
-            /* devno 使用设备编号 (可能不同于枚举 N) */
-            n = (int)dev_num.DeviceNumber;  /* 覆盖循环变量 */
+            devno = (int32_t)dev_num.DeviceNumber;
         }
 
         /* 计算总容量 */
@@ -74,7 +74,7 @@ int volume_enumerate(volume_list_t *list) {
                              * geom.BytesPerSector;
 
         volume_info_t *vol = &list->volumes[list->count];
-        vol->devno         = (int32_t)n;
+        vol->devno         = devno;
         vol->total_sectors = (uint64_t)geom.Cylinders.QuadPart
                             * geom.TracksPerCylinder
                             * geom.SectorsPerTrack;
@@ -84,7 +84,7 @@ int volume_enumerate(volume_list_t *list) {
         snprintf(vol->path, sizeof(vol->path), "%s", path);
 
         LOG_INFO("volume: PhysicalDrive%d — %.2f GB (%llu blocks @ 1MB)",
-                 n, (double)total_bytes / (1024.0 * 1024.0 * 1024.0),
+                 (int)devno, (double)total_bytes / (1024.0 * 1024.0 * 1024.0),
                  (unsigned long long)vol->block_count);
 
         CloseHandle(h);

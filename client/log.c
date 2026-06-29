@@ -84,6 +84,11 @@ void log_write(int level, const char *file, int line,
     va_end(args);
 
     /* Thread-safe write */
+    /* Log init not called yet — skip silently */
+    if (!g_log_file) {
+        return;
+    }
+
 #ifdef _WIN32
     EnterCriticalSection(&g_log_lock);
 #else

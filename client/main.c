@@ -164,7 +164,10 @@ typedef struct {
 static int cmd_info(void) {
     volume_list_t vol_list;
     if (volume_enumerate(&vol_list) != 0) {
-        fprintf(stderr, "No fixed disks found or access denied.\n");
+        printf("No fixed disks found.\n");
+        printf("Possible causes:\n");
+        printf("  - Not running as Administrator (required for disk access)\n");
+        printf("  - No fixed disks in this system\n");
         return 1;
     }
 
@@ -190,7 +193,7 @@ static int cmd_info(void) {
 static int cmd_hash(const char *filepath) {
     FILE *f = fopen(filepath, "rb");
     if (!f) {
-        fprintf(stderr, "Cannot open: %s\n", filepath);
+        printf("Cannot open: %s\n", filepath);
         return 1;
     }
 
@@ -199,14 +202,14 @@ static int cmd_hash(const char *filepath) {
     fseek(f, 0, SEEK_SET);
 
     if (size <= 0) {
-        fprintf(stderr, "Empty or invalid file: %s\n", filepath);
+        printf("Empty or invalid file: %s\n", filepath);
         fclose(f);
         return 1;
     }
 
     uint8_t *buf = malloc((size_t)size);
     if (!buf) {
-        fprintf(stderr, "Out of memory\n");
+        printf("Out of memory\n");
         fclose(f);
         return 1;
     }
@@ -230,7 +233,7 @@ static int cmd_hash(const char *filepath) {
 static int cmd_check(const char *disk_path) {
     block_reader_t *r = block_reader_open(disk_path);
     if (!r) {
-        fprintf(stderr, "Cannot open disk: %s\n", disk_path);
+        printf("Cannot open disk: %s\n", disk_path);
         return 1;
     }
 
@@ -666,6 +669,9 @@ int main(int argc, char *argv[]) {
         printf("\nConfig file defaults to user.json\n");
         return 0;
     }
+
+    /* Init log early so subcommands can use LOG_* macros safely */
+    log_init(LOG_LEVEL_INFO, NULL);
 
     /* 子命令 */
     if (strcmp(argv[1], "info") == 0) {
