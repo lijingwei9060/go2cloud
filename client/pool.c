@@ -97,15 +97,23 @@ int pool_init(socket_pool_t *p, const char *server_ip, uint16_t server_port) {
     if (!p->mutex) return -1;
     MUTEX_INIT((mutex_t *)p->mutex);
 
-    /* 预建立连接 */
+    /* 预建立连接 — 先存储 server 信息到所有槽位, 再尝试连接 */
     for (int i = 0; i < SOCKET_POOL_TARGET; i++) {
+        pool_conn_t *c = &p->conns[i];
+        memset(c, 0, sizeof(*c));
+        c->fd = SOCKET_ERR;
+        c->server_port = server_port;
+        c->in_use = 0;
+        strncpy(c->server_ip, server_ip, sizeof(c->server_ip) - 1);
+        c->send_scratch = malloc(SEND_SCRATCH_SIZE);
+        if (!c->send_scratch) continue;
+        c->send_scratch_cap = SEND_SCRATCH_SIZE;
+
         socket_t fd = pool_connect(server_ip, server_port);
         if (fd == SOCKET_ERR) {
             if (i == 0) {
                 LOG_ERROR("pool_init: cannot establish any connection to %s:%d",
                           server_ip, (int)server_port);
-                MUTEX_DEL((mutex_t *)p->mutex);
-                free(p->mutex);
                 return -1;
             }
             LOG_WARN("pool_init: only %d/%d connections established",
@@ -113,21 +121,9 @@ int pool_init(socket_pool_t *p, const char *server_ip, uint16_t server_port) {
             break;
         }
 
-        pool_conn_t *c = &p->conns[i];
-        memset(c, 0, sizeof(*c));
-        c->fd             = fd;
-        c->server_port    = server_port;
-        c->in_use         = 0;
-        c->last_active    = time(NULL);
-        c->created_at     = time(NULL);
-        c->send_scratch = malloc(SEND_SCRATCH_SIZE);
-        if (!c->send_scratch) {
-            CLOSE_SOCK(fd);
-            break;
-        }
-        c->send_scratch_cap = SEND_SCRATCH_SIZE;
-        strncpy(c->server_ip, server_ip, sizeof(c->server_ip) - 1);
-
+        c->fd          = fd;
+        c->last_active = time(NULL);
+        c->created_at  = time(NULL);
         p->count++;
         LOG_INFO("pool: connected #%d to %s:%d (fd=%d)",
                  i, server_ip, (int)server_port, (int)fd);
@@ -161,10 +157,13 @@ void pool_destroy(socket_pool_t *p) {
 pool_conn_t *pool_acquire(socket_pool_t *p) {
     MUTEX_LOCK((mutex_t *)p->mutex);
 
-    /* 先查找空闲连接 */
-    for (int i = 0; i < SOCKET_POOL_TARGET; i++) {
+    /* Round-robin: start scanning from next_index */
+    int start = p->next_index;
+    for (int attempt = 0; attempt < SOCKET_POOL_TARGET; attempt++) {
+        int i = (start + attempt) % SOCKET_POOL_TARGET;
         if (p->conns[i].fd != SOCKET_ERR && !p->conns[i].in_use) {
             p->conns[i].in_use = 1;
+            p->next_index = (i + 1) % SOCKET_POOL_TARGET;
             MUTEX_UNLOCK((mutex_t *)p->mutex);
             return &p->conns[i];
         }
@@ -173,24 +172,16 @@ pool_conn_t *pool_acquire(socket_pool_t *p) {
     /* 尝试创建新连接 */
     if (p->count < SOCKET_POOL_TARGET) {
         for (int i = 0; i < SOCKET_POOL_TARGET; i++) {
-            if (p->conns[i].fd == SOCKET_ERR) {
+            if (p->conns[i].fd == SOCKET_ERR && p->conns[i].send_scratch) {
                 socket_t fd = pool_connect(p->conns[i].server_ip,
                                            p->conns[i].server_port);
                 if (fd != SOCKET_ERR) {
                     pool_conn_t *c = &p->conns[i];
-                    if (!c->send_scratch) {
-                        c->send_scratch = malloc(SEND_SCRATCH_SIZE);
-                        if (!c->send_scratch) {
-                            CLOSE_SOCK(fd);
-                            MUTEX_UNLOCK((mutex_t *)p->mutex);
-                            return NULL;
-                        }
-                        c->send_scratch_cap = SEND_SCRATCH_SIZE;
-                    }
                     c->fd          = fd;
                     c->in_use      = 1;
                     c->last_active = time(NULL);
                     p->count++;
+                    p->next_index = (i + 1) % SOCKET_POOL_TARGET;
                     MUTEX_UNLOCK((mutex_t *)p->mutex);
                     return c;
                 }

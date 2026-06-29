@@ -509,7 +509,7 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
     }
 
     /* 增量模式: 发送 ctlIncremental */
-    if (ctx->zstd_level > 1) {
+    if (ctx->tail_send) {
         pool_conn_t *c = pool_acquire(&ctx->pool);
         if (c) {
             wire_send_control(c->fd, CTL_INCREMENTAL, CTL_INCREMENTAL_LEN);
@@ -610,7 +610,7 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
     }
 
     /* 增量模式: 发送 ctlEndIncremental, 等待 SERVER_DONE */
-    if (ctx->zstd_level > 1) {
+    if (ctx->tail_send) {
         pool_conn_t *c = pool_acquire(&ctx->pool);
         if (c) {
             wire_send_control(c->fd, CTL_END_INCREMENTAL, CTL_END_INCREMENTAL_LEN);

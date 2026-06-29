@@ -8,6 +8,14 @@
 #include <string.h>
 #include <stdio.h>
 
+#ifdef _WIN32
+#include <winsock2.h>
+#define CLOSE_SOCKET(s) closesocket(s)
+#else
+#include <unistd.h>
+#define CLOSE_SOCKET(s) close(s)
+#endif
+
 static session_t *g_sessions[MAX_SESSIONS];
 static int g_session_count = 0;
 
@@ -53,6 +61,7 @@ void session_remove(int fd) {
                      fd, g_sessions[i]->remote_addr,
                      (unsigned long long)g_sessions[i]->blocks_received,
                      (unsigned long long)g_sessions[i]->bytes_received);
+            CLOSE_SOCKET(g_sessions[i]->fd);
             free(g_sessions[i]);
             /* 收缩数组 */
             memmove(&g_sessions[i], &g_sessions[i + 1],

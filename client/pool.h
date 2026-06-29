@@ -52,6 +52,7 @@ typedef struct {
 typedef struct {
     pool_conn_t conns[SOCKET_POOL_TARGET];
     int         count;                    /* 当前已建立连接数 */
+    int         next_index;               /* round-robin: next slot to try */
     void       *mutex;                    /* 平台互斥锁 */
 } socket_pool_t;
 

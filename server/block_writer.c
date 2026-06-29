@@ -37,9 +37,13 @@ typedef struct {
     int   registered;   /* 1 = registered */
 } target_disk_t;
 
+/* Periodic fsync: flush every N blocks (~= every N MB) */
+#define FSYNC_BLOCK_INTERVAL  2000
+
 static target_disk_t g_disks[MAX_TARGET_DISKS];
 static uint64_t      g_total_blocks = 0;
 static uint64_t      g_total_bytes  = 0;
+static uint64_t      g_blocks_since_fsync = 0;
 
 int block_writer_init(void) {
     memset(g_disks, 0, sizeof(g_disks));
@@ -48,6 +52,7 @@ int block_writer_init(void) {
     }
     g_total_blocks = 0;
     g_total_bytes  = 0;
+    g_blocks_since_fsync = 0;
     return 0;
 }
 
@@ -144,6 +149,13 @@ int block_writer_write(int32_t devno, int64_t offset,
     /* Update stats */
     g_total_blocks++;
     g_total_bytes += len;
+
+    /* Periodic fsync: flush every FSYNC_BLOCK_INTERVAL blocks (~2GB) */
+    g_blocks_since_fsync++;
+    if (g_blocks_since_fsync >= FSYNC_BLOCK_INTERVAL) {
+        block_writer_fsync_all();
+        g_blocks_since_fsync = 0;
+    }
 
     LOG_DEBUG("wrote block devno=%d offset=%lld size=%u (total: %llu blocks, %llu bytes)",
               devno, (long long)offset, len,
