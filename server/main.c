@@ -239,50 +239,57 @@ static void handle_session(session_t *s) {
             return;
         }
 
-        /* Feed decoder — may receive multiple frames at once */
-        size_t consumed = 0;
-        const uint8_t *ptr = tmp_buf;
-        while (consumed < (size_t)n) {
-            int rc = protocol_decode(s, ptr, (size_t)n - consumed, msg);
+        /* Feed freshly received data to decoder once.
+         * protocol_decode appends to session->recv_buf, and any leftover
+         * partial frame stays buffered.  We then loop with zero-length
+         * calls to flush any complete frames formed by concatenation. */
+        {
+            int rc = protocol_decode(s, tmp_buf, (size_t)n, msg);
             if (rc < 0) {
                 LOG_ERROR("session %d protocol error", s->fd);
                 free(msg);
                 session_remove(s->fd);
                 return;
             }
-            if (rc == 0) break;  /* need more data */
 
-            /* Successfully decoded a message — update activity time */
-            session_touch(s);
+            /* Keep decoding while there are complete frames buffered */
+            while (rc == 1) {
+                session_touch(s);
 
-            /* Process decoded result */
-            switch (msg->type) {
-            case DECODE_DATA_BLOCK:
-                if (block_writer_write(msg->devno, msg->offset,
-                                       msg->data, msg->data_len) == 0) {
-                    ack_send_block(s->fd, msg->devno, msg->data_len, msg->offset);
+                switch (msg->type) {
+                case DECODE_DATA_BLOCK:
+                    if (block_writer_write(msg->devno, msg->offset,
+                                           msg->data, msg->data_len) == 0) {
+                        ack_send_block(s->fd, msg->devno, msg->data_len, msg->offset);
+                    }
+                    break;
+
+                case DECODE_CTL_INCREMENTAL:
+                    s->incremental = 1;
+                    LOG_INFO("session %d incremental mode enabled", s->fd);
+                    break;
+
+                case DECODE_CTL_END_INCREMENTAL:
+                    LOG_INFO("session %d incremental round complete, fsyncing...", s->fd);
+                    block_writer_fsync_all();
+                    ack_send_done(s->fd);
+                    LOG_INFO("session %d incremental round finished", s->fd);
+                    break;
+
+                default:
+                    LOG_WARN("session %d unknown decode result %d", s->fd, msg->type);
+                    break;
                 }
-                break;
 
-            case DECODE_CTL_INCREMENTAL:
-                s->incremental = 1;
-                LOG_INFO("session %d incremental mode enabled", s->fd);
-                break;
-
-            case DECODE_CTL_END_INCREMENTAL:
-                LOG_INFO("session %d incremental round complete, fsyncing...", s->fd);
-                block_writer_fsync_all();
-                ack_send_done(s->fd);
-                LOG_INFO("session %d incremental round finished", s->fd);
-                break;
-
-            default:
-                LOG_WARN("session %d unknown decode result %d", s->fd, msg->type);
-                break;
+                /* Try to decode next frame already in recv_buf (no new data) */
+                rc = protocol_decode(s, NULL, 0, msg);
             }
-
-            consumed = (size_t)n - s->recv_len;
-            ptr = tmp_buf + consumed;
+            if (rc < 0) {
+                LOG_ERROR("session %d protocol error", s->fd);
+                free(msg);
+                session_remove(s->fd);
+                return;
+            }
         }
     }
 }

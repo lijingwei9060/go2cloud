@@ -166,14 +166,16 @@ static int msgpack_decode_block(const uint8_t *buf, size_t buf_len,
  */
 int protocol_decode(session_t *session, const uint8_t *buf, size_t len,
                     decoded_msg_t *out) {
-    /* 向内部缓冲区追加新数据 */
-    if (session->recv_len + len > sizeof(session->recv_buf)) {
-        LOG_ERROR("session %d recv buffer overflow (%zu + %zu)",
-                  session->fd, (size_t)session->recv_len, len);
-        return -1;
+    /* 向内部缓冲区追加新数据 (len=0 的调用仅解码已有缓冲) */
+    if (len > 0) {
+        if (session->recv_len + len > sizeof(session->recv_buf)) {
+            LOG_ERROR("session %d recv buffer overflow (%zu + %zu)",
+                      session->fd, (size_t)session->recv_len, len);
+            return -1;
+        }
+        memcpy(session->recv_buf + session->recv_len, buf, len);
+        session->recv_len += len;
     }
-    memcpy(session->recv_buf + session->recv_len, buf, len);
-    session->recv_len += len;
 
     /* 需要至少 4 字节才能读取帧长度 */
     if (session->recv_len < TCP_FRAME_HEADER_SIZE) {
