@@ -39,6 +39,9 @@ int block_writer_fsync_all(void);
 int block_writer_write(int32_t devno, int64_t offset,
                        const uint8_t *data, uint32_t len);
 
+/* 检查是否有磁盘已注册 */
+int block_writer_has_registered(void);
+
 /* 获取已写入块的总数 */
 uint64_t block_writer_total_blocks(void);
 

@@ -450,7 +450,7 @@ int main(int argc, char *argv[]) {
     }
 
     /* If no disks registered, use default */
-    if (block_writer_total_blocks() == 0 && block_writer_total_bytes() == 0) {
+    if (!block_writer_has_registered()) {
         printf("No target disks configured, using default: /tmp/receiver_disk0.img\n");
         block_writer_register(0, "/tmp/receiver_disk0.img");
     }

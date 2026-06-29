@@ -152,5 +152,12 @@ int block_writer_write(int32_t devno, int64_t offset,
     return 0;
 }
 
+int block_writer_has_registered(void) {
+    for (int i = 0; i < MAX_TARGET_DISKS; i++) {
+        if (g_disks[i].registered) return 1;
+    }
+    return 0;
+}
+
 uint64_t block_writer_total_blocks(void) { return g_total_blocks; }
 uint64_t block_writer_total_bytes(void)  { return g_total_bytes; }
