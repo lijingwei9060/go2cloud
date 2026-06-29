@@ -651,7 +651,7 @@ int main(int argc, char *argv[]) {
         printf("  %s <ip:port> [config.json]    Run migration\n", argv[0]);
         printf("  %s info                       Show disk information\n", argv[0]);
         printf("  %s hash <file>                Compute block hash\n", argv[0]);
-        printf("  %s check <disk>               Check disk accessibility\n");
+        printf("  %s check <disk>               Check disk accessibility\n", argv[0]);
         printf("  %s --help                     Show this help\n", argv[0]);
         return 0;
     }

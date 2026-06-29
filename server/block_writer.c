@@ -41,13 +41,14 @@ static target_disk_t g_disks[MAX_TARGET_DISKS];
 static uint64_t      g_total_blocks = 0;
 static uint64_t      g_total_bytes  = 0;
 
-void block_writer_init(void) {
+int block_writer_init(void) {
     memset(g_disks, 0, sizeof(g_disks));
     for (int i = 0; i < MAX_TARGET_DISKS; i++) {
         g_disks[i].fd = -1;
     }
     g_total_blocks = 0;
     g_total_bytes  = 0;
+    return 0;
 }
 
 int block_writer_register(int devno, const char *filepath) {

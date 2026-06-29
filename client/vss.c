@@ -43,7 +43,7 @@ typedef HRESULT (WINAPI *PFN_CreateVssBackupComponents)(
 static PFN_CreateVssBackupComponents g_pfn_create = NULL;
 
 vss_context_t *vss_init(void) {
-    vss_context_t *ctx = calloc(1, sizeof(*ctx));
+    vss_context_t *ctx = (vss_context_t *)calloc(1, sizeof(*ctx));
     if (!ctx) return NULL;
 
     /* 加载 vssapi.dll */

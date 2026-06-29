@@ -25,6 +25,10 @@
 
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define VSS_MAX_VOLUMES      16      /* 最多快照卷数 */
 #define VSS_SNAPSHOT_PATH_MAX 512    /* 快照路径最大长度 */
 
@@ -82,5 +86,9 @@ int vss_backup_complete(vss_context_t *ctx);
  * 如果需要块级访问, 使用快照的设备路径 (如 \\?\GLOBALROOT\Device\HarddiskVolumeShadowCopyN)。
  */
 const char *vss_snapshot_device_path(const vss_snapshot_t *snap);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* CLIENT_VSS_H */

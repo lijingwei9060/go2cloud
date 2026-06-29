@@ -13,6 +13,10 @@
 #include <stdio.h>
 #include <time.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* Log level constants (use these for g_log_level / log_init) */
 #define LOG_LEVEL_TRACE  1
 #define LOG_LEVEL_DEBUG  2
@@ -42,5 +46,9 @@ void log_write(int level, const char *file, int line,
 #define LOG_INFO(fmt, ...)   log_write(LOG_LEVEL_INFO,  __FILE__, __LINE__, fmt, ##__VA_ARGS__)
 #define LOG_WARN(fmt, ...)   log_write(LOG_LEVEL_WARN,  __FILE__, __LINE__, fmt, ##__VA_ARGS__)
 #define LOG_ERROR(fmt, ...)  log_write(LOG_LEVEL_ERROR, __FILE__, __LINE__, fmt, ##__VA_ARGS__)
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* CLIENT_LOG_H */

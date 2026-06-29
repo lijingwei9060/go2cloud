@@ -1,0 +1,26 @@
+# Build outputs
+*.exe
+*.obj
+*.o
+*.dll
+*.so
+
+# Build logs
+*.log
+build_output.log
+
+# IDE
+.vs/
+*.user
+*.suo
+*.sln
+*.vcxproj
+
+# SQLite
+*.db
+*.db-journal
+*.db-wal
+
+# Temp
+*.tmp
+*~
