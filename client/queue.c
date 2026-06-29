@@ -1,9 +1,8 @@
 /*
- * queue.c — 发送队列模块实现
+ * queue.c — send queue module implementation
  *
- * 环形缓冲区 + 互斥锁的线程安全队列。
- * 平台适配: Windows 用 CRITICAL_SECTION, Linux 用 pthread_mutex_t。
- * 存储为 opaque void* 以保持头文件不依赖平台头文件。
+ * Ring buffer + mutex for thread safety.
+ * Each entry's payload is heap-allocated, freed on ack or destroy.
  */
 
 #include "queue.h"
@@ -39,6 +38,13 @@ int queue_init(send_queue_t *q) {
 
 void queue_destroy(send_queue_t *q) {
     if (q->mutex) {
+        /* Free all heap payloads */
+        for (int i = 0; i < QUEUE_CAPACITY; i++) {
+            if (q->entries[i].payload) {
+                free(q->entries[i].payload);
+                q->entries[i].payload = NULL;
+            }
+        }
         MUTEX_DEL(q->mutex);
         free(q->mutex);
         q->mutex = NULL;
@@ -57,23 +63,33 @@ int queue_push(send_queue_t *q, int32_t devno, int64_t offset, uint64_t hash,
 
     if (q->count >= QUEUE_CAPACITY) {
         MUTEX_UNLOCK(q->mutex);
-        return -1;  /* 队列满 */
+        return -1;
     }
 
     int slot = q->head;
     queue_entry_t *e = &q->entries[slot];
 
+    /* Allocate and copy payload */
+    uint8_t *copy = malloc(payload_len);
+    if (!copy) {
+        MUTEX_UNLOCK(q->mutex);
+        return -1;
+    }
+    memcpy(copy, payload, payload_len);
+
+    /* Free old payload if any (shouldn't happen with ring buffer) */
+    if (e->payload) free(e->payload);
+
     e->devno       = devno;
     e->offset      = offset;
     e->hash        = hash;
+    e->payload     = copy;
     e->payload_len = payload_len;
-    memcpy(e->payload, payload, payload_len);
     e->pending     = 1;
 
     q->head = (slot + 1) % QUEUE_CAPACITY;
     q->count++;
 
-    /* 背压检查 */
     if (q->count >= BACKPRESSURE_QUEUE_DEPTH) {
         q->backpressure = 1;
     }
@@ -97,10 +113,10 @@ int queue_pop(send_queue_t *q, queue_entry_t *out) {
 
     int slot = q->tail;
     memcpy(out, &q->entries[slot], sizeof(*out));
+    /* Ownership of payload REMAINS with queue — caller reads but doesn't free */
     q->tail = (slot + 1) % QUEUE_CAPACITY;
     q->count--;
 
-    /* 背压解除 */
     if (q->count < BACKPRESSURE_QUEUE_DEPTH) {
         q->backpressure = 0;
     }
@@ -112,11 +128,14 @@ int queue_pop(send_queue_t *q, queue_entry_t *out) {
 void queue_ack(send_queue_t *q, int32_t devno, int64_t offset) {
     MUTEX_LOCK(q->mutex);
 
-    /* 线性扫描匹配 devno+offset (ACK 不频繁, 简单扫描即可) */
     for (int i = 0; i < QUEUE_CAPACITY; i++) {
         queue_entry_t *e = &q->entries[i];
         if (e->pending && e->devno == devno && e->offset == offset) {
             e->pending = 0;
+            if (e->payload) {
+                free(e->payload);
+                e->payload = NULL;
+            }
             break;
         }
     }
