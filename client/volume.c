@@ -83,7 +83,7 @@ int volume_enumerate(volume_list_t *list) {
         vol->writable      = 0;  /* 源端只读 */
         snprintf(vol->path, sizeof(vol->path), "%s", path);
 
-        LOG_INFO("volume: PhysicalDrive%d — %.2f GB (%llu blocks @ 1MB)",
+        LOG_INFO("volume: PhysicalDrive%d - %.2f GB (%llu blocks @ 1MB)",
                  (int)devno, (double)total_bytes / (1024.0 * 1024.0 * 1024.0),
                  (unsigned long long)vol->block_count);
 
