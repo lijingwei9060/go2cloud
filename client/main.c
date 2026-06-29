@@ -701,8 +701,8 @@ int main(int argc, char *argv[]) {
     char *config_json = read_file_all(config_path);
 
     /* 解析配置 */
-    int log_level    = LOG_INFO;
-    int zstd_level   = ZSTD_COMPRESS_LEVEL_MAX;  /* 默认全量: 级别 7 */
+    int log_level    = LOG_LEVEL_INFO;
+    int zstd_level   = ZSTD_COMPRESS_LEVEL_MAX;  /* full migration: level 7 */
     int tail_send    = 0;
     char log_path[256] = {0};
     char db_path[512]  = "tracker.db";
@@ -716,7 +716,7 @@ int main(int argc, char *argv[]) {
         /* 日志配置 */
         const char *log_section = json_nav(config_json, "Log");
         if (log_section) {
-            log_level = json_read_int(log_section, "Level", LOG_INFO);
+            log_level = json_read_int(log_section, "Level", LOG_LEVEL_INFO);
             json_read_str(log_section, "Path", log_path, sizeof(log_path));
         }
 

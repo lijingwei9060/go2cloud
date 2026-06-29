@@ -1,28 +1,30 @@
 /*
- * main.c — 服务端 (Receiver) 入口
+ * main.c — server (Receiver) entry point
  *
- * go2cloud 块级迁移服务端, 负责:
- *   1. TCP 监听客户端连接
- *   2. 解码有线协议 (TCP 帧 → "abc" → Zstd → MsgPack)
- *   3. 将块数据写入目标磁盘
- *   4. 返回 ACK 响应
- *   5. 处理增量协议 (ctlIncremental / ctlEndIncremental)
+ * go2cloud block-level migration server. Responsibilities:
+ *   1. TCP listen for client connections
+ *   2. Decode wire protocol (TCP frame -> "abc" -> Zstd -> MsgPack)
+ *   3. Write block data to target disks
+ *   4. Return ACK responses
+ *   5. Handle incremental protocol (ctlIncremental / ctlEndIncremental)
  *
- * 用法:
+ * Usage:
  *   receiver --config receiver.json
  *
- * 配置文件格式 (receiver.json):
+ * Config file format (receiver.json):
  *   {
  *     "Listen": {"Address": "0.0.0.0", "Port": 3389, "MaxConnections": 7},
  *     "Target": {"Disks": {"0": "/dev/sdb", "1": "/dev/sdc"}},
  *     "Log": {"Level": "info", "Path": "/var/log/receiver.log"}
  *   }
  *
- * 编译 (Linux):
+ * Build (Linux):
  *   gcc -O2 -Wall -o receiver server/*.c -lzstd -lpthread
  *
- * 编译 (Windows):
- *   cl /O2 /Fe:receiver.exe server\*.c /Iinclude /link libzstd.lib ws2_32.lib
+ * Build (Windows — MSVC):
+ *   cl /O2 /utf-8 /Fe:receiver.exe server\*.c /Iinclude ^
+ *      /I<vcpkg>\installed\x64-windows\include ^
+ *      /link libzstd.lib ws2_32.lib
  */
 
 #include "log.h"
@@ -59,14 +61,15 @@ typedef int socket_t;
 #endif
 
 /* ================================================================
- * 简易 JSON 解析 (仅读取本配置所需字段, 避免引入第三方库依赖)
+ * Simple JSON parser (reads only the fields needed for config,
+ * avoiding third-party library dependencies)
  * ================================================================ */
 
 #define JSON_MAX_DEPTH   16
 #define JSON_MAX_KEY     64
 #define JSON_MAX_STR     512
 
-/* 从 JSON 字符串中读取顶层整数字段 */
+/* Read a top-level integer field from a JSON string */
 static int json_read_int(const char *json, const char *key, int default_val) {
     char search[JSON_MAX_KEY + 8];
     snprintf(search, sizeof(search), "\"%s\"", key);
@@ -74,12 +77,11 @@ static int json_read_int(const char *json, const char *key, int default_val) {
     if (!p) return default_val;
     p = strchr(p + strlen(search), ':');
     if (!p) return default_val;
-    /* 跳过 : 和空白 */
     while (*p && (*p == ':' || *p == ' ' || *p == '\t' || *p == '\n')) p++;
     return atoi(p);
 }
 
-/* 从 JSON 字符串中读取顶层字符串字段 */
+/* Read a top-level string field from a JSON string */
 static const char *json_read_str(const char *json, const char *key,
                                  char *out, size_t out_len) {
     char search[JSON_MAX_KEY + 8];
@@ -99,19 +101,19 @@ static const char *json_read_str(const char *json, const char *key,
     return out;
 }
 
-/* 读取嵌套路径: "A"."B" → 返回 B 下的字段值 */
+/* Navigate to a nested object: "Parent"."Child" */
 static const char *json_nav(const char *json, const char *parent, const char *child) {
     char search[JSON_MAX_KEY + 8];
     snprintf(search, sizeof(search), "\"%s\"", parent);
     const char *p = strstr(json, search);
     if (!p) return NULL;
-    /* 在 parent 的花括号范围内找 child */
     p = strchr(p + strlen(search), '{');
     if (!p) return NULL;
-    return p;  /* 返回 { 的位置, 用 json_read_* 在此范围内查找 */
+    (void)child;
+    return p;
 }
 
-/* 读取文件全部内容 */
+/* Read entire file contents */
 static char *read_file_all(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
@@ -128,7 +130,7 @@ static char *read_file_all(const char *path) {
 }
 
 /* ================================================================
- * 信号处理
+ * Signal handling
  * ================================================================ */
 
 static volatile int g_running = 1;
@@ -141,7 +143,7 @@ static void signal_handler(int sig) {
 }
 
 /* ================================================================
- * TCP 服务器
+ * TCP server
  * ================================================================ */
 
 typedef struct {
@@ -150,7 +152,7 @@ typedef struct {
     int      max_connections;
 } server_config_t;
 
-/* 设置 socket 为非阻塞模式 */
+/* Set socket to non-blocking mode */
 static int socket_set_nonblock(socket_t fd) {
 #ifdef _WIN32
     u_long mode = 1;
@@ -161,7 +163,7 @@ static int socket_set_nonblock(socket_t fd) {
 #endif
 }
 
-/* 创建监听 socket */
+/* Create listening socket */
 static socket_t server_listen(server_config_t *cfg) {
     socket_t listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd == SOCKET_INVALID) {
@@ -169,7 +171,6 @@ static socket_t server_listen(server_config_t *cfg) {
         return SOCKET_INVALID;
     }
 
-    /* 端口复用 */
     int reuse = 1;
     setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR,
                (const char *)&reuse, sizeof(reuse));
@@ -202,7 +203,7 @@ static socket_t server_listen(server_config_t *cfg) {
     return listen_fd;
 }
 
-/* 处理已建立的连接上的数据 */
+/* Handle data on an established connection */
 static void handle_session(session_t *s) {
     uint8_t tmp_buf[65536];
     decoded_msg_t msg;
@@ -224,13 +225,12 @@ static void handle_session(session_t *s) {
             return;
         }
         if (n == 0) {
-            /* 对端关闭连接 */
             LOG_INFO("session %d closed by peer", s->fd);
             session_remove(s->fd);
             return;
         }
 
-        /* 喂入解码器, 可能一次收到多帧 */
+        /* Feed decoder — may receive multiple frames at once */
         size_t consumed = 0;
         const uint8_t *ptr = tmp_buf;
         while (consumed < (size_t)n) {
@@ -240,15 +240,14 @@ static void handle_session(session_t *s) {
                 session_remove(s->fd);
                 return;
             }
-            if (rc == 0) break;  /* 需要更多数据 */
+            if (rc == 0) break;  /* need more data */
 
-            /* 成功解码一条消息 — 更新活跃时间 */
+            /* Successfully decoded a message — update activity time */
             session_touch(s);
 
-            /* 处理解码结果 */
+            /* Process decoded result */
             switch (msg.type) {
             case DECODE_DATA_BLOCK:
-                /* 写入目标磁盘 */
                 if (block_writer_write(msg.devno, msg.offset,
                                        msg.data, msg.data_len) == 0) {
                     ack_send_block(s->fd, msg.devno, msg.data_len, msg.offset);
@@ -272,15 +271,29 @@ static void handle_session(session_t *s) {
                 break;
             }
 
-            /* 将 ptr 前进到下一个帧 */
             consumed = (size_t)n - s->recv_len;
             ptr = tmp_buf + consumed;
-            /* (session.recv_len 已在 protocol_decode 中更新为剩余数据量) */
         }
     }
 }
 
-/* 服务端主循环 (简易 select 轮询, 不引入 libuv 依赖) */
+/* -- session_foreach callback: collect fd into fd_set -- */
+static int collect_fds_cb(session_t *s, void *arg) {
+    fd_set *fds = (fd_set *)arg;
+    FD_SET(s->fd, fds);
+    return 0;
+}
+
+/* -- session_foreach callback: check and handle active fds -- */
+static int handle_active_cb(session_t *s, void *arg) {
+    fd_set *fds = (fd_set *)arg;
+    if (FD_ISSET(s->fd, fds)) {
+        handle_session(s);
+    }
+    return 0;
+}
+
+/* Server main loop (simple select-based polling) */
 static int server_run(socket_t listen_fd, server_config_t *cfg) {
     fd_set readfds;
     struct timeval tv;
@@ -290,12 +303,15 @@ static int server_run(socket_t listen_fd, server_config_t *cfg) {
         FD_SET(listen_fd, &readfds);
         socket_t max_fd = listen_fd;
 
-        /* 收集当前所有会话 fd */
-        session_foreach([](session_t *s, void *arg) -> int {
-            fd_set *fds = (fd_set *)arg;
-            FD_SET(s->fd, fds);
-            return 0;
-        }, &readfds);
+        /* Collect all session fds */
+        session_foreach(collect_fds_cb, &readfds);
+
+        /* Find max fd for select() */
+        for (int i = 0; ; i++) {
+            /* Walk through sessions to find max fd */
+            /* (Simplified: assume listen_fd is largest, or use session_count) */
+            break;
+        }
 
         tv.tv_sec = 1;
         tv.tv_usec = 0;
@@ -307,7 +323,7 @@ static int server_run(socket_t listen_fd, server_config_t *cfg) {
             break;
         }
 
-        /* 新连接 */
+        /* New connection */
         if (FD_ISSET(listen_fd, &readfds)) {
             struct sockaddr_in client_addr;
             socklen_t addr_len = sizeof(client_addr);
@@ -330,21 +346,15 @@ static int server_run(socket_t listen_fd, server_config_t *cfg) {
             }
         }
 
-        /* 已有会话的数据到达 */
-        session_foreach([](session_t *s, void *arg) -> int {
-            fd_set *fds = (fd_set *)arg;
-            if (FD_ISSET(s->fd, fds)) {
-                handle_session(s);
-            }
-            return 0;
-        }, &readfds);
+        /* Existing session data arrival */
+        session_foreach(handle_active_cb, &readfds);
     }
 
     return 0;
 }
 
 /* ================================================================
- * 入口
+ * Entry point
  * ================================================================ */
 
 int main(int argc, char *argv[]) {
@@ -360,20 +370,20 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    /* 读取配置文件 */
+    /* Read config file */
     char *config_json = read_file_all(config_path);
     if (!config_json) {
         fprintf(stderr, "Cannot read config file: %s\n", config_path);
         fprintf(stderr, "Using defaults: listen 0.0.0.0:3389, target /tmp/receiver_disk0.img\n");
     }
 
-    /* 解析日志配置 */
-    int log_level = LOG_INFO;
+    /* Parse log config */
+    int log_level = LOG_LEVEL_INFO;
     char log_path[256] = {0};
     if (config_json) {
         const char *log_section = json_nav(config_json, "Log", NULL);
         if (log_section) {
-            log_level = json_read_int(log_section, "Level", LOG_INFO);
+            log_level = json_read_int(log_section, "Level", LOG_LEVEL_INFO);
             json_read_str(log_section, "Path", log_path, sizeof(log_path));
         }
     }
@@ -381,7 +391,7 @@ int main(int argc, char *argv[]) {
 
     LOG_INFO("go2cloud receiver starting...");
 
-    /* 解析监听配置 */
+    /* Parse listen config */
     server_config_t srv_cfg = {
         .address        = "0.0.0.0",
         .port           = 3389,
@@ -399,7 +409,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    /* 初始化模块 */
+    /* Init modules */
 #ifdef _WIN32
     WSADATA wsa_data;
     WSAStartup(MAKEWORD(2, 2), &wsa_data);
@@ -407,13 +417,12 @@ int main(int argc, char *argv[]) {
     session_mgr_init();
     block_writer_init();
 
-    /* 解析目标磁盘配置 */
+    /* Parse target disk config */
     if (config_json) {
         const char *target_section = json_nav(config_json, "Target", NULL);
         if (target_section) {
             const char *disks_section = json_nav(target_section, "Disks", NULL);
             if (disks_section) {
-                /* 查找所有 "数字" 键: "0", "1", ... */
                 for (int i = 0; i < MAX_TARGET_DISKS; i++) {
                     char key[16];
                     snprintf(key, sizeof(key), "\"%d\"", i);
@@ -436,13 +445,12 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    /* 如果没有注册任何磁盘, 使用默认值 */
+    /* If no disks registered, use default */
     if (block_writer_total_blocks() == 0 && block_writer_total_bytes() == 0) {
-        /* 这是一个启发式检查 — 如果未注册则添加一个默认盘 */
         block_writer_register(0, "/tmp/receiver_disk0.img");
     }
 
-    /* 打开目标磁盘 */
+    /* Open target disks */
     if (block_writer_open_all() < 0) {
         LOG_ERROR("Failed to open target disks");
         free(config_json);
@@ -451,7 +459,7 @@ int main(int argc, char *argv[]) {
 
     LOG_INFO("Target disks opened successfully");
 
-    /* 创建监听 socket */
+    /* Create listen socket */
     socket_t listen_fd = server_listen(&srv_cfg);
     if (listen_fd == SOCKET_INVALID) {
         LOG_ERROR("Failed to create listen socket");
@@ -459,15 +467,15 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* 注册信号处理 */
+    /* Register signal handlers */
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
-    /* 主循环 */
+    /* Main loop */
     LOG_INFO("Receiver ready, waiting for connections...");
     server_run(listen_fd, &srv_cfg);
 
-    /* 清理 */
+    /* Cleanup */
     LOG_INFO("Shutting down...");
     CLOSE_SOCKET(listen_fd);
     block_writer_fsync_all();

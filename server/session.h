@@ -15,7 +15,7 @@
 #define REMOTE_ID_MAX_LEN  256   /* 主机名最大长度 */
 
 /* 客户端会话 */
-typedef struct {
+typedef struct session {
     int      fd;                  /* TCP socket 文件描述符 */
     char     remote_addr[64];     /* 对端 IP 地址 (日志用) */
     char     remote_id[REMOTE_ID_MAX_LEN]; /* 客户端主机名 */

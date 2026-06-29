@@ -1,5 +1,5 @@
 /*
- * log.c — 服务端日志模块实现
+ * log.c — server-side log module implementation
  */
 
 #include "log.h"
@@ -15,7 +15,7 @@ static CRITICAL_SECTION g_log_lock;
 static pthread_mutex_t g_log_lock = PTHREAD_MUTEX_INITIALIZER;
 #endif
 
-int    g_log_level = LOG_INFO;
+int    g_log_level = LOG_LEVEL_INFO;
 static FILE *g_log_file = NULL;
 
 int log_init(int level, const char *filepath) {
@@ -46,17 +46,18 @@ void log_write(int level, const char *file, int line,
                const char *fmt, ...) {
     if (level < g_log_level) return;
 
-    /* 级别标签 */
-    static const char *tags[] = {
-        [LOG_TRACE] = "[TRACE]",
-        [LOG_DEBUG] = "[DEBUG]",
-        [LOG_INFO ] = "[INFO ]",
-        [LOG_WARN ] = "[WARN ]",
-        [LOG_ERROR] = "[ERROR]",
+    /* Level tag strings */
+    static const char *k_tags[] = {
+        "",
+        "[TRACE]",
+        "[DEBUG]",
+        "[INFO ]",
+        "[WARN ]",
+        "[ERROR]",
     };
-    const char *tag = (level >= 1 && level <= 5) ? tags[level] : "[     ]";
+    const char *tag = (level >= 1 && level <= 5) ? k_tags[level] : "[     ]";
 
-    /* 时间戳 */
+    /* Timestamp */
     time_t now = time(NULL);
     struct tm tm_buf;
 #ifdef _WIN32
@@ -70,19 +71,19 @@ void log_write(int level, const char *file, int line,
              tm_buf.tm_year + 1900, tm_buf.tm_mon + 1, tm_buf.tm_mday,
              tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec);
 
-    /* 只取文件名 (不含路径) */
+    /* Extract filename (no path) */
     const char *fname = strrchr(file, '/');
     if (!fname) fname = strrchr(file, '\\');
     fname = fname ? fname + 1 : file;
 
-    /* 格式化可变参数 */
+    /* Format variadic args */
     char msg[4096];
     va_list args;
     va_start(args, fmt);
     vsnprintf(msg, sizeof(msg), fmt, args);
     va_end(args);
 
-    /* 线程安全写入 */
+    /* Thread-safe write */
 #ifdef _WIN32
     EnterCriticalSection(&g_log_lock);
 #else
