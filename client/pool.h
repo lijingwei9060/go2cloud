@@ -29,6 +29,9 @@ typedef int socket_t;
 
 #include "../include/protocol.h"
 
+/* Send scratch buffer: ZSTD_COMPRESS_BOUND(~1MB) + 7B framing */
+#define SEND_SCRATCH_SIZE  0x130000  /* ~1.2MB, safe for incompressible data */
+
 /* 单个池连接 */
 typedef struct {
     socket_t  fd;                         /* TCP socket */

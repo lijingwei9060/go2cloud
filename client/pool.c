@@ -120,12 +120,12 @@ int pool_init(socket_pool_t *p, const char *server_ip, uint16_t server_port) {
         c->in_use         = 0;
         c->last_active    = time(NULL);
         c->created_at     = time(NULL);
-        c->send_scratch = malloc(0x100000 + 1024);
+        c->send_scratch = malloc(SEND_SCRATCH_SIZE);
         if (!c->send_scratch) {
             CLOSE_SOCK(fd);
             break;
         }
-        c->send_scratch_cap = 0x100000 + 1024;
+        c->send_scratch_cap = SEND_SCRATCH_SIZE;
         strncpy(c->server_ip, server_ip, sizeof(c->server_ip) - 1);
 
         p->count++;
@@ -179,13 +179,13 @@ pool_conn_t *pool_acquire(socket_pool_t *p) {
                 if (fd != SOCKET_ERR) {
                     pool_conn_t *c = &p->conns[i];
                     if (!c->send_scratch) {
-                        c->send_scratch = malloc(0x100000 + 1024);
+                        c->send_scratch = malloc(SEND_SCRATCH_SIZE);
                         if (!c->send_scratch) {
                             CLOSE_SOCK(fd);
                             MUTEX_UNLOCK((mutex_t *)p->mutex);
                             return NULL;
                         }
-                        c->send_scratch_cap = 0x100000 + 1024;
+                        c->send_scratch_cap = SEND_SCRATCH_SIZE;
                     }
                     c->fd          = fd;
                     c->in_use      = 1;
