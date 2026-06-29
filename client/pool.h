@@ -40,8 +40,8 @@ typedef struct {
     uint64_t  blocks_sent;                /* 此连接上已发送的块数 */
     uint64_t  bytes_sent;                 /* 此连接上已发送的字节数 */
 
-    /* 发送临时缓冲区 (Zstd 压缩 + 帧化) */
-    uint8_t   send_scratch[0x100000 + 1024]; /* ~1MB + 1KB */
+    /* 发送临时缓冲区 (Zstd 压缩 + 帧化), 堆分配避免栈溢出 */
+    uint8_t  *send_scratch;
     size_t    send_scratch_cap;
 } pool_conn_t;
 
