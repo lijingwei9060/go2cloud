@@ -188,6 +188,14 @@ static int cmd_info(void) {
 }
 
 /* ================================================================
+ * 子命令: begin_session — 标记会话开始
+ * ================================================================ */
+
+static int cmd_begin_session(void) {
+    return 0;
+}
+
+/* ================================================================
  * 子命令: hash <file> — 计算文件哈希
  * ================================================================ */
 
@@ -798,6 +806,7 @@ int main(int argc, char *argv[]) {
         printf("  %s info                       Show disk information\n", argv[0]);
         printf("  %s hash <file>                Compute block hash\n", argv[0]);
         printf("  %s check <disk>               Check disk accessibility\n", argv[0]);
+        printf("  %s begin_session              Mark migration session start\n", argv[0]);
         printf("  %s --help                     Show this help\n", argv[0]);
         return 0;
     }
@@ -809,6 +818,7 @@ int main(int argc, char *argv[]) {
         printf("  %s info\n", argv[0]);
         printf("  %s hash <file>\n", argv[0]);
         printf("  %s check <disk>\n", argv[0]);
+        printf("  %s begin_session\n", argv[0]);
         printf("\nConfig file defaults to user.json\n");
         return 0;
     }
@@ -825,6 +835,9 @@ int main(int argc, char *argv[]) {
     }
     if (strcmp(argv[1], "check") == 0 && argc >= 3) {
         return cmd_check(argv[2]);
+    }
+    if (strcmp(argv[1], "begin_session") == 0) {
+        return cmd_begin_session();
     }
 
     /* ————— 迁移模式 ————— */
