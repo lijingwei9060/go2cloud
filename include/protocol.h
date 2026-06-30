@@ -155,6 +155,10 @@ typedef enum {
 #define RECONNECT_TIMER_REPEAT_MS 18000 /* 重连重复: 18 秒 */
 #define ACTION_TIMER_MS          10000  /* 定期动作: 10 秒 */
 
+/* 增量同步收敛控制 */
+#define MAX_INCREMENTAL_ROUNDS   60     /* 最大增量轮次 (30 min @ 18s), 超时强制结束 */
+#define CONVERGENCE_ZERO_ROUNDS  3      /* 连续 N 轮无变化块 → 判定收敛, 强制 allDone */
+
 /* ================================================================
  * 消息缓冲区大小
  * ================================================================ */

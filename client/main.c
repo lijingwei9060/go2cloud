@@ -160,6 +160,8 @@ typedef struct {
     int           all_done;          /* 1 = 增量同步全部完成, 可以退出 */
     int           ctl_end_sent;      /* 1 = ctlEndIncremental 已发送 */
     int           server_done_rcvd;  /* 1 = 已收到 SERVER_DONE */
+    int           inc_round;         /* 增量轮次计数 */
+    int           zero_change_rounds;/* 连续无变化轮次数 */
 } migrate_ctx_t;
 
 /* ================================================================
@@ -736,7 +738,7 @@ static void shuffle_blocks(int32_t *devnos, int64_t *offsets,
  * data_buf:     块读取缓冲区 (≥ 1MB)
  * db:           SQLite 块跟踪数据库
  */
-static void do_incremental_round(migrate_ctx_t *ctx,
+static int do_incremental_round(migrate_ctx_t *ctx,
                                   reader_entry_t *live_readers,
                                   reader_entry_t *vss_readers,
                                   int reader_count,
@@ -754,7 +756,7 @@ static void do_incremental_round(migrate_ctx_t *ctx,
                                               512, remote_id);
     if (count <= 0) {
         LOG_DEBUG("incremental round: no unacked blocks");
-        return;
+        return 0;
     }
 
     /* Fisher-Yates 随机打乱, 避免顺序 I/O 导致磁盘缓存命中偏差 */
@@ -838,7 +840,7 @@ static void do_incremental_round(migrate_ctx_t *ctx,
         while ((rc = queue_push(&ctx->queue, devno, (int64_t)disk_offset,
                                  new_hash, ctx->mp_writer.buf,
                                  ctx->mp_writer.written)) != 0) {
-            if (!g_running) return;
+            if (!g_running) return requeued;
             while (flush_one(ctx) > 0) { }
             process_ack(ctx);
 #ifdef _WIN32
@@ -862,31 +864,16 @@ static void do_incremental_round(migrate_ctx_t *ctx,
         LOG_INFO("incremental round: %d blocks re-sent (%d total unacked)",
                  requeued, count);
     }
+    return requeued;
 }
 
 /*
- * timer_cb_real: 检查是否所有块都已确认, 若是则发送 ctlEndIncremental
- * 并等待服务端 SERVER_DONE, 然后设置 allDone=1。
+ * timer_cb_real: 发送 ctlEndIncremental, 等待 SERVER_DONE, 设置 allDone=1。
  *
- * 仅在增量模式下调用, 每次增量轮后检查。
- * 返回 1 表示 allDone (迁移完成), 0 表示继续。
+ * 仅在明确需要结束时调用 (已通过 should_finish 检查)。
+ * 返回 1 表示 allDone 已设置, 0 表示失败需重试。
  */
-static int timer_cb_real(migrate_ctx_t *ctx, sqlite_db_t *db) {
-    char remote_id[256];
-    snprintf(remote_id, sizeof(remote_id), "%s:%d",
-             ctx->server_ip, (int)ctx->server_port);
-
-    /* 检查是否有未确认块 */
-    int unacked = sqlite_count_unacked(db, remote_id);
-    if (unacked > 0) {
-        return 0;  /* 还有块未确认, 继续增量同步 */
-    }
-
-    /* 如果 ctlEndIncremental 已发送且服务端已回复 SERVER_DONE */
-    if (ctx->all_done) {
-        return 1;  /* 已完成 */
-    }
-
+static int timer_cb_real(migrate_ctx_t *ctx) {
     /* 排空队列: 确保所有块都已发送 */
     while (queue_count(&ctx->queue) > 0 && g_running) {
         while (flush_one(ctx) > 0) { }
@@ -896,12 +883,6 @@ static int timer_cb_real(migrate_ctx_t *ctx, sqlite_db_t *db) {
 #else
         usleep(50000);
 #endif
-    }
-
-    /* 再次确认: 排空后可能还有未确认块 */
-    unacked = sqlite_count_unacked(db, remote_id);
-    if (unacked > 0) {
-        return 0;
     }
 
     /* 发送 ctlEndIncremental */
@@ -923,7 +904,6 @@ static int timer_cb_real(migrate_ctx_t *ctx, sqlite_db_t *db) {
     ctx->server_done_rcvd = 0;
     for (int w = 0; w < 3000 && g_running && !ctx->server_done_rcvd; w++) {
         process_ack(ctx);
-        /* 排空任何残留的发送 */
         while (flush_one(ctx) > 0) { }
 #ifdef _WIN32
         Sleep(100);
@@ -939,6 +919,53 @@ static int timer_cb_real(migrate_ctx_t *ctx, sqlite_db_t *db) {
     ctx->all_done = 1;
     LOG_INFO("allDone set, migration complete");
     return 1;
+}
+
+/*
+ * should_finish: 判断增量同步是否应该结束。
+ *
+ * 三种退出条件 (任满足其一即返回 1):
+ *   1. 完美收敛 — 所有块已 ACK (unacked == 0)
+ *   2. 稳定收敛 — 连续 N 轮无变化块, 剩余未 ACK 块已全部发送完毕
+ *      (系统热块不再产生新写入, 只是等待服务端确认)
+ *   3. 轮次上限 — 超过 MAX_INCREMENTAL_ROUNDS, 强制结束避免无限循环
+ *
+ * 返回 1 表示应该结束, 0 表示继续增量同步。
+ */
+static int should_finish(migrate_ctx_t *ctx, sqlite_db_t *db, int requeued) {
+    char remote_id[256];
+    snprintf(remote_id, sizeof(remote_id), "%s:%d",
+             ctx->server_ip, (int)ctx->server_port);
+    int unacked = sqlite_count_unacked(db, remote_id);
+
+    /* 条件 1: 完美收敛 — 零未确认块 */
+    if (unacked == 0) {
+        LOG_INFO("incremental sync: perfect convergence (0 unacked blocks)");
+        return 1;
+    }
+
+    /* 条件 2: 稳定收敛 — 连续 N 轮无新变化块 */
+    if (requeued == 0) {
+        ctx->zero_change_rounds++;
+        if (ctx->zero_change_rounds >= CONVERGENCE_ZERO_ROUNDS) {
+            LOG_INFO("incremental sync: converged after %d rounds with 0 changes "
+                     "(unacked=%d, will recover via NTFS journal replay on target)",
+                     ctx->zero_change_rounds, unacked);
+            return 1;
+        }
+    } else {
+        ctx->zero_change_rounds = 0;  /* 有新变化 → 重置计数器 */
+    }
+
+    /* 条件 3: 轮次上限 — 超时强制结束 */
+    if (ctx->inc_round >= MAX_INCREMENTAL_ROUNDS) {
+        LOG_WARN("incremental sync: max rounds reached (%d), forcing finish "
+                 "(unacked=%d, will recover via NTFS journal replay on target)",
+                 MAX_INCREMENTAL_ROUNDS, unacked);
+        return 1;
+    }
+
+    return 0;
 }
 
 /*
@@ -1232,11 +1259,15 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
      * 当所有块已确认且服务端返回 SERVER_DONE 后退出。
      * ================================================================ */
     if (ctx->tail_send) {
-        LOG_INFO("entering incremental sync loop (interval=%d ms)",
-                 RETRANSMIT_TIMER_MS);
+        LOG_INFO("entering incremental sync loop (interval=%d ms, "
+                 "max_rounds=%d, convergence_rounds=%d)",
+                 RETRANSMIT_TIMER_MS,
+                 MAX_INCREMENTAL_ROUNDS, CONVERGENCE_ZERO_ROUNDS);
 
         /* 重置增量定时器: 全量同步完成后 18s 开始第一轮增量 */
         ctx->timer.last_fire[TIMER_INCREMENTAL] = timer_now_ms();
+        ctx->inc_round = 0;
+        ctx->zero_change_rounds = 0;
 
         while (g_running && !ctx->all_done) {
             /* 发送 + 接收 + 定时器处理 */
@@ -1248,10 +1279,25 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
             timer_event_t ev;
             while ((ev = timer_check(&ctx->timer, now)) != TIMER_NONE) {
                 switch (ev) {
-                case TIMER_INCREMENTAL:
-                    do_incremental_round(ctx, readers, readers,
-                                         reader_count, db, data_buf);
+                case TIMER_INCREMENTAL: {
+                    ctx->inc_round++;
+                    int requeued = do_incremental_round(ctx, readers, readers,
+                                                         reader_count, db, data_buf);
+                    LOG_INFO("incremental round %d/%d: %d blocks re-sent, "
+                             "%d unacked, %d stable rounds",
+                             ctx->inc_round, MAX_INCREMENTAL_ROUNDS,
+                             requeued,
+                             sqlite_count_unacked(db, remote_id),
+                             ctx->zero_change_rounds);
+
+                    /* 检查是否应该结束 (完美收敛 / 稳定收敛 / 超时) */
+                    if (should_finish(ctx, db, requeued)) {
+                        if (timer_cb_real(ctx)) {
+                            break;  /* allDone — 退出定时器循环 */
+                        }
+                    }
                     break;
+                }
                 case TIMER_RETRANSMIT:
                     do_retransmit(ctx, db, readers, reader_count, data_buf);
                     break;
@@ -1259,21 +1305,19 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
                     do_reconnect(ctx);
                     break;
                 case TIMER_ACTION:
-                    LOG_INFO("incremental: %d unacked blocks, queue=%d",
+                    LOG_INFO("incremental: round %d/%d, %d unacked blocks, "
+                             "queue=%d, stable=%d rounds",
+                             ctx->inc_round, MAX_INCREMENTAL_ROUNDS,
                              sqlite_count_unacked(db, remote_id),
-                             queue_count(&ctx->queue));
+                             queue_count(&ctx->queue),
+                             ctx->zero_change_rounds);
                     break;
                 default:
                     break;
                 }
                 timer_reset(&ctx->timer, ev);
 
-                /* 每轮增量后检查 allDone */
-                if (ev == TIMER_INCREMENTAL) {
-                    if (timer_cb_real(ctx, db)) {
-                        break;  /* allDone — 退出定时器循环 */
-                    }
-                }
+                if (ctx->all_done) break;
                 now = timer_now_ms();
             }
 
@@ -1290,7 +1334,8 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
 
         /* 清理块跟踪表 (原始行为: allDone=1 → DELETE FROM T_BLOCK → exit) */
         if (ctx->all_done) {
-            LOG_INFO("incremental sync complete, clearing T_BLOCK");
+            LOG_INFO("incremental sync complete after %d rounds, clearing T_BLOCK",
+                     ctx->inc_round);
             sqlite_clear_all_blocks(db);
         }
     } else {
