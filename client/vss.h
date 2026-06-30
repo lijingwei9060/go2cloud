@@ -40,17 +40,34 @@ typedef struct {
     int      valid;                           /* 1 = 有效快照 */
 } vss_snapshot_t;
 
+/* 快照信息 (用于查询结果) */
+typedef struct {
+    char     snapshot_id_str[64];     /* GUID 字符串 (如 {xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}) */
+    char     original_volume[64];
+    char     snapshot_path[VSS_SNAPSHOT_PATH_MAX];
+    char     creation_time[64];       /* 格式化时间字符串 */
+    uint64_t snapshot_id[2];          /* 原始 GUID (128-bit, 用于删除操作) */
+} vss_snapshot_info_t;
+
 /* VSS 上下文 */
 typedef struct vss_context vss_context_t;
 
 /*
- * 初始化 VSS 子系统。
+ * 初始化 VSS 子系统 (默认 VSS_CTX_BACKUP)。
  *
  * 加载 vssapi.dll, 获取函数指针。
  *
  * 返回不透明上下文, 失败返回 NULL。
  */
 vss_context_t *vss_init(void);
+
+/*
+ * 初始化 VSS 子系统 (指定上下文)。
+ *
+ * context: VSS_CTX_BACKUP (非持久) 或 VSS_CTX_CLIENT_ACCESSIBLE (持久)。
+ * 必须在 vss_create_snapshots 之前调用。
+ */
+vss_context_t *vss_init_ex(long context);
 
 /* 清理 VSS 子系统 (不删除快照) */
 void vss_cleanup(vss_context_t *ctx);
@@ -86,6 +103,30 @@ int vss_backup_complete(vss_context_t *ctx);
  * 如果需要块级访问, 使用快照的设备路径 (如 \\?\GLOBALROOT\Device\HarddiskVolumeShadowCopyN)。
  */
 const char *vss_snapshot_device_path(const vss_snapshot_t *snap);
+
+/*
+ * 查询系统上所有现有快照。
+ *
+ * info:      输出数组, 存放快照信息
+ * max_count: 数组最大容量
+ *
+ * 返回实际快照数, 错误返回 -1。
+ */
+int vss_query_snapshots(vss_snapshot_info_t *info, int max_count);
+
+/*
+ * 删除指定快照 (通过 GUID 字符串或 "all")。
+ *
+ * 返回删除数量, 错误返回 -1。
+ */
+int vss_delete_snapshot(const char *snapshot_id_str);
+
+/*
+ * 删除系统上所有快照。
+ *
+ * 返回删除数量, 错误返回 -1。
+ */
+int vss_delete_all_snapshots(void);
 
 #ifdef __cplusplus
 }

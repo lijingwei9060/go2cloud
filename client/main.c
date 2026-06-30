@@ -225,7 +225,7 @@ static int cmd_sentbytes(const char *db_path) {
  * ================================================================ */
 
 static int cmd_test_vss(void) {
-    vss_context_t *ctx = vss_init();
+    vss_context_t *ctx = vss_init_ex(0x1d /* VSS_CTX_CLIENT_ACCESSIBLE */);
     if (!ctx) {
         printf("VSS init failed\n");
         return 1;
@@ -246,6 +246,57 @@ static int cmd_test_vss(void) {
 
     vss_backup_complete(ctx);
     vss_cleanup(ctx);
+    return 0;
+}
+
+static int cmd_vss_query(void) {
+    vss_snapshot_info_t info[64];
+    memset(info, 0, sizeof(info));
+
+    int n = vss_query_snapshots(info, 64);
+    if (n < 0) {
+        printf("vss_query failed\n");
+        return 1;
+    }
+
+    if (n == 0) {
+        printf("No snapshots found.\n");
+        return 0;
+    }
+
+    for (int i = 0; i < n; i++) {
+        printf("Shadow Copy ID: %s\n", info[i].snapshot_id_str);
+        printf("  Original Volume: %s\n", info[i].original_volume);
+        printf("  Device Object:   %s\n", info[i].snapshot_path);
+        printf("  Creation Time:   %s\n", info[i].creation_time);
+        printf("\n");
+    }
+
+    return 0;
+}
+
+static int cmd_vss_delete(int argc, char *argv[]) {
+    if (argc < 3) {
+        printf("Usage: vss_delete <guid> | --all\n");
+        return 1;
+    }
+
+    if (strcmp(argv[2], "--all") == 0) {
+        int deleted = vss_delete_all_snapshots();
+        if (deleted < 0) {
+            printf("vss_delete --all failed\n");
+            return 1;
+        }
+        printf("Deleted %d snapshot(s).\n", deleted);
+        return 0;
+    }
+
+    int deleted = vss_delete_snapshot(argv[2]);
+    if (deleted < 0) {
+        printf("vss_delete failed\n");
+        return 1;
+    }
+    printf("Deleted %d snapshot(s).\n", deleted);
     return 0;
 }
 
@@ -933,6 +984,9 @@ int main(int argc, char *argv[]) {
         printf("  %s end_session                Clean block tracking database\n", argv[0]);
         printf("  %s sentbytes                  Print total confirmed bytes\n", argv[0]);
         printf("  %s test_vss                   Test VSS snapshot functionality\n", argv[0]);
+        printf("  %s vss_query                  List all existing snapshots\n", argv[0]);
+        printf("  %s vss_delete <guid>          Delete specific snapshot\n", argv[0]);
+        printf("  %s vss_delete --all           Delete all snapshots\n", argv[0]);
         printf("  %s --help                     Show this help\n", argv[0]);
         return 0;
     }
@@ -949,6 +1003,9 @@ int main(int argc, char *argv[]) {
         printf("  %s end_session\n", argv[0]);
         printf("  %s sentbytes\n", argv[0]);
         printf("  %s test_vss\n", argv[0]);
+        printf("  %s vss_query\n", argv[0]);
+        printf("  %s vss_delete <guid>\n", argv[0]);
+        printf("  %s vss_delete --all\n", argv[0]);
         printf("\nConfig file defaults to user.json\n");
         return 0;
     }
@@ -980,6 +1037,12 @@ int main(int argc, char *argv[]) {
     }
     if (strcmp(argv[1], "test_vss") == 0) {
         return cmd_test_vss();
+    }
+    if (strcmp(argv[1], "vss_query") == 0) {
+        return cmd_vss_query();
+    }
+    if (strcmp(argv[1], "vss_delete") == 0) {
+        return cmd_vss_delete(argc, argv);
     }
 
     /* ————— 迁移模式 ————— */

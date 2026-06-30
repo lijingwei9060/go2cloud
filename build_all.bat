@@ -52,6 +52,11 @@ if %ERRORLEVEL% neq 0 (
     goto :end
 )
 echo [OK] client.exe built
+if exist D:\migrate\ (
+    copy /y client.exe D:\migrate\ >nul && echo [OK] client.exe -> D:\migrate
+) else (
+    echo [WARN] D:\migrate not found, skip copy
+)
 
 :end
 echo.
