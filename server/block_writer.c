@@ -44,6 +44,7 @@ static target_disk_t g_disks[MAX_TARGET_DISKS];
 static uint64_t      g_total_blocks = 0;
 static uint64_t      g_total_bytes  = 0;
 static uint64_t      g_blocks_since_fsync = 0;
+static uint64_t      g_pending_bytes = 0;  /* bytes since last BINLOG notification */
 
 int block_writer_init(void) {
     memset(g_disks, 0, sizeof(g_disks));
@@ -149,6 +150,7 @@ int block_writer_write(int32_t devno, int64_t offset,
     /* Update stats */
     g_total_blocks++;
     g_total_bytes += len;
+    g_pending_bytes += len;
 
     /* Periodic fsync: flush every FSYNC_BLOCK_INTERVAL blocks (~2GB) */
     g_blocks_since_fsync++;
@@ -173,3 +175,9 @@ int block_writer_has_registered(void) {
 
 uint64_t block_writer_total_blocks(void) { return g_total_blocks; }
 uint64_t block_writer_total_bytes(void)  { return g_total_bytes; }
+
+uint64_t block_writer_pending_bytes(void) {
+    uint64_t pending = g_pending_bytes;
+    g_pending_bytes = 0;
+    return pending;
+}

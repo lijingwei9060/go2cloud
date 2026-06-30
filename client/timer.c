@@ -13,14 +13,17 @@
 
 void timer_init(timer_mgr_t *tm) {
     uint64_t now = timer_now_ms();
-    tm->interval[TIMER_RETRANSMIT] = RETRANSMIT_TIMER_MS;
-    tm->interval[TIMER_RECONNECT]  = RECONNECT_TIMER_MS;
-    tm->interval[TIMER_ACTION]     = ACTION_TIMER_MS;
+    tm->interval[TIMER_RETRANSMIT]   = RETRANSMIT_TIMER_MS;
+    tm->interval[TIMER_RECONNECT]    = RECONNECT_TIMER_MS;
+    tm->interval[TIMER_ACTION]       = ACTION_TIMER_MS;
+    tm->interval[TIMER_INCREMENTAL]  = RETRANSMIT_TIMER_MS;  /* 18s */
 
-    /* 错开首次触发: 连接建立后立即检查, 动作延迟 5 秒开始 */
-    tm->last_fire[TIMER_RETRANSMIT] = now;
-    tm->last_fire[TIMER_RECONNECT]  = now;
-    tm->last_fire[TIMER_ACTION]     = now + 5000 - ACTION_TIMER_MS;
+    /* 错开首次触发: 连接建立后立即检查, 动作延迟 5 秒开始,
+     * 增量延迟 18 秒后开始 (全量同步完成后再激活) */
+    tm->last_fire[TIMER_RETRANSMIT]  = now;
+    tm->last_fire[TIMER_RECONNECT]   = now;
+    tm->last_fire[TIMER_ACTION]      = now + 5000 - ACTION_TIMER_MS;
+    tm->last_fire[TIMER_INCREMENTAL] = now;  /* reset when full sync done */
 }
 
 uint64_t timer_now_ms(void) {

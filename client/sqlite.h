@@ -87,6 +87,31 @@ int sqlite_get_unacked(sqlite_db_t *db,
                        int max_entries, const char *remote_id);
 
 /*
+ * 获取所有未确认块的 devno/offset/hash/last_sent 列表。
+ * 用于增量同步: 从 live disk 重读并 hash 对比, 仅重发变化的块。
+ *
+ * hashes:          [out] 块哈希值数组 (可为 NULL)
+ * last_sent_times: [out] 上次发送时间数组 (可为 NULL)
+ * 返回条目数, 错误返回 -1。
+ */
+int sqlite_get_unacked_with_hash(sqlite_db_t *db,
+                                  int32_t *devnos, int64_t *offsets,
+                                  uint64_t *hashes, int64_t *last_sent_times,
+                                  int max_entries, const char *remote_id);
+
+/*
+ * 更新块的 last_sent 时间戳。
+ * timestamp_ms: 当前时间 (毫秒)
+ */
+int sqlite_update_last_sent(sqlite_db_t *db, int32_t devno, int64_t offset,
+                             int64_t timestamp_ms);
+
+/*
+ * 统计未确认块的总数。
+ */
+int sqlite_count_unacked(sqlite_db_t *db, const char *remote_id);
+
+/*
  * 查询已确认块的总字节数 (ack=1)。
  * 用于跨进程进度查询 (sentbytes 子命令)。
  */

@@ -21,6 +21,7 @@ typedef enum {
     TIMER_RETRANSMIT,    /* 重传未确认块 */
     TIMER_RECONNECT,     /* 重建连接 */
     TIMER_ACTION,        /* 定期动作 */
+    TIMER_INCREMENTAL,   /* 增量同步: 每 18s 从 live disk 重读并 hash 对比 */
     TIMER_COUNT
 } timer_event_t;
 

@@ -28,9 +28,11 @@ struct sqlite_db {
     "  size      INTEGER," \
     "  hash      INTEGER," \
     "  ack       INTEGER DEFAULT 0," \
+    "  last_sent INTEGER DEFAULT 0," \
     "  remote_id TEXT" \
     ");" \
-    "CREATE UNIQUE INDEX IF NOT EXISTS idx_block ON T_BLOCK(devno, offset);"
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_block ON T_BLOCK(devno, offset);" \
+    "CREATE INDEX IF NOT EXISTS idx_ack ON T_BLOCK(ack);"
 
 #define SQL_LOOKUP \
     "SELECT hash FROM T_BLOCK WHERE devno=? AND offset=?"
@@ -39,8 +41,8 @@ struct sqlite_db {
     "SELECT ack FROM T_BLOCK WHERE devno=? AND offset=?"
 
 #define SQL_UPSERT \
-    "INSERT OR REPLACE INTO T_BLOCK(devno, offset, size, hash, ack, remote_id) " \
-    "VALUES(?, ?, ?, ?, ?, ?)"
+    "INSERT OR REPLACE INTO T_BLOCK(devno, offset, size, hash, ack, last_sent, remote_id) " \
+    "VALUES(?, ?, ?, ?, ?, ?, ?)"
 
 #define SQL_MARK_ACK \
     "UPDATE T_BLOCK SET ack=1 WHERE devno=? AND offset=?"
@@ -48,6 +50,16 @@ struct sqlite_db {
 #define SQL_GET_UNACKED \
     "SELECT devno, offset FROM T_BLOCK WHERE ack=0 AND remote_id=? " \
     "ORDER BY offset LIMIT ?"
+
+#define SQL_GET_UNACKED_WITH_HASH \
+    "SELECT devno, offset, hash, last_sent FROM T_BLOCK " \
+    "WHERE ack=0 AND remote_id=? ORDER BY offset LIMIT ?"
+
+#define SQL_UPDATE_LAST_SENT \
+    "UPDATE T_BLOCK SET last_sent=? WHERE devno=? AND offset=?"
+
+#define SQL_COUNT_UNACKED \
+    "SELECT COUNT(*) FROM T_BLOCK WHERE ack=0 AND remote_id=?"
 
 sqlite_db_t *sqlite_open(const char *db_path) {
     sqlite3 *handle = NULL;
@@ -187,7 +199,8 @@ int sqlite_block_upsert(sqlite_db_t *db, int32_t devno, int64_t offset,
     sqlite3_bind_int(stmt, 3, size);
     sqlite3_bind_int64(stmt, 4, (sqlite3_int64)hash);
     sqlite3_bind_int(stmt, 5, ack);
-    sqlite3_bind_text(stmt, 6, db->remote_id, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(stmt, 6, 0);  /* last_sent: 0 until sent */
+    sqlite3_bind_text(stmt, 7, db->remote_id, -1, SQLITE_STATIC);
 
     rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
@@ -235,6 +248,62 @@ int sqlite_get_unacked(sqlite_db_t *db,
         count++;
     }
 
+    sqlite3_finalize(stmt);
+    return count;
+}
+
+int sqlite_get_unacked_with_hash(sqlite_db_t *db,
+                                  int32_t *devnos, int64_t *offsets,
+                                  uint64_t *hashes, int64_t *last_sent_times,
+                                  int max_entries, const char *remote_id) {
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db->handle, SQL_GET_UNACKED_WITH_HASH, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) return -1;
+
+    sqlite3_bind_text(stmt, 1, remote_id ? remote_id : db->remote_id,
+                      -1, SQLITE_STATIC);
+    sqlite3_bind_int(stmt, 2, max_entries);
+
+    int count = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW && count < max_entries) {
+        devnos[count]          = sqlite3_column_int(stmt, 0);
+        offsets[count]         = sqlite3_column_int64(stmt, 1);
+        if (hashes)            hashes[count] = (uint64_t)sqlite3_column_int64(stmt, 2);
+        if (last_sent_times)   last_sent_times[count] = sqlite3_column_int64(stmt, 3);
+        count++;
+    }
+
+    sqlite3_finalize(stmt);
+    return count;
+}
+
+int sqlite_update_last_sent(sqlite_db_t *db, int32_t devno, int64_t offset,
+                             int64_t timestamp_ms) {
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db->handle, SQL_UPDATE_LAST_SENT, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) return -1;
+
+    sqlite3_bind_int64(stmt, 1, timestamp_ms);
+    sqlite3_bind_int(stmt, 2, devno);
+    sqlite3_bind_int64(stmt, 3, offset);
+
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_DONE) ? 0 : -1;
+}
+
+int sqlite_count_unacked(sqlite_db_t *db, const char *remote_id) {
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db->handle, SQL_COUNT_UNACKED, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) return -1;
+
+    sqlite3_bind_text(stmt, 1, remote_id ? remote_id : db->remote_id,
+                      -1, SQLITE_STATIC);
+
+    int count = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        count = sqlite3_column_int(stmt, 0);
+    }
     sqlite3_finalize(stmt);
     return count;
 }

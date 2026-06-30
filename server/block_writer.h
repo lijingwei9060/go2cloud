@@ -48,4 +48,7 @@ uint64_t block_writer_total_blocks(void);
 /* 获取已写入字节总数 */
 uint64_t block_writer_total_bytes(void);
 
+/* 获取并重置自上次 BINLOG 通知以来的待处理字节数 */
+uint64_t block_writer_pending_bytes(void);
+
 #endif /* SERVER_BLOCK_WRITER_H */

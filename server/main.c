@@ -261,6 +261,13 @@ static void handle_session(session_t *s) {
                     if (block_writer_write(msg->devno, msg->offset,
                                            msg->data, msg->data_len) == 0) {
                         ack_send_block(s->fd, msg->devno, msg->data_len, msg->offset);
+
+                        /* BINLOG monitoring: alert client when pending write buffer
+                         * exceeds BINLOG_SIZE_LIMIT (10 GB), so client can throttle
+                         * or trigger an early incremental round. */
+                        if (block_writer_pending_bytes() >= BINLOG_SIZE_LIMIT) {
+                            ack_send_binlog(s->fd, msg->devno, msg->data_len, msg->offset);
+                        }
                     }
                     break;
 
@@ -294,6 +301,13 @@ static void handle_session(session_t *s) {
     }
 }
 
+/* -- session_foreach callback: find maximum fd -- */
+static int find_max_fd_cb(session_t *s, void *arg) {
+    socket_t *max_fd = (socket_t *)arg;
+    if (s->fd > *max_fd) *max_fd = s->fd;
+    return 0;
+}
+
 /* -- session_foreach callback: collect fd into fd_set -- */
 static int collect_fds_cb(session_t *s, void *arg) {
     fd_set *fds = (fd_set *)arg;
@@ -323,12 +337,8 @@ static int server_run(socket_t listen_fd, server_config_t *cfg) {
         /* Collect all session fds */
         session_foreach(collect_fds_cb, &readfds);
 
-        /* Find max fd for select() */
-        for (int i = 0; ; i++) {
-            /* Walk through sessions to find max fd */
-            /* (Simplified: assume listen_fd is largest, or use session_count) */
-            break;
-        }
+        /* Find max fd for select() — walk all sessions to track highest fd */
+        session_foreach(find_max_fd_cb, &max_fd);
 
         tv.tv_sec = 1;
         tv.tv_usec = 0;

@@ -157,6 +157,9 @@ typedef struct {
     send_queue_t  queue;             /* 发送队列 */
     timer_mgr_t   timer;             /* 定时器 */
     msgpack_writer_t mp_writer;     /* MsgPack 编码器 */
+    int           all_done;          /* 1 = 增量同步全部完成, 可以退出 */
+    int           ctl_end_sent;      /* 1 = ctlEndIncremental 已发送 */
+    int           server_done_rcvd;  /* 1 = 已收到 SERVER_DONE */
 } migrate_ctx_t;
 
 /* ================================================================
@@ -473,8 +476,8 @@ static void process_ack(migrate_ctx_t *ctx) {
                     sqlite_block_mark_acked(ctx->db, resp.devno, resp.offset);
                 }
             } else if (resp.type == RESPONSE_SERVER_DONE) {
-                LOG_INFO("SERVER_DONE: incremental round complete");
-                /* 增量轮次结束 — 可以开始下一轮 */
+                LOG_INFO("SERVER_DONE received from server");
+                ctx->server_done_rcvd = 1;
             } else if (resp.type == RESPONSE_BINLOG) {
                 LOG_WARN("BINLOG alert: devno=%d size=%d",
                          resp.devno, resp.size);
@@ -540,23 +543,39 @@ static int send_block(migrate_ctx_t *ctx, block_reader_t *reader,
         return -1;
     }
 
-    /* 入队 */
-    int rc = queue_push(&ctx->queue, devno, (int64_t)disk_offset, h,
-                        ctx->mp_writer.buf, ctx->mp_writer.written);
-    if (rc == -1) {
-        LOG_WARN("queue full, block %d:%llu dropped", devno,
-                 (unsigned long long)disk_offset);
-        return -1;
-    }
-    if (rc == 2) {
-        /* 背压 — 等待队列排空 */
-        LOG_DEBUG("backpressure at block %d:%llu", devno,
-                  (unsigned long long)disk_offset);
+    /* 入队 (带背压重试: 队列满时排空并等待后重试, 不丢弃块) */
+    int rc;
+    int retry = 0;
+    while ((rc = queue_push(&ctx->queue, devno, (int64_t)disk_offset, h,
+                            ctx->mp_writer.buf, ctx->mp_writer.written)) != 0) {
+        if (!g_running) return -1;
+
+        if (rc == 2 || rc == -1) {
+            /* 排空队列 + 处理 ACK 释放已发送块 */
+            while (flush_one(ctx) > 0) { }
+            process_ack(ctx);
+
 #ifdef _WIN32
-        Sleep(BACKPRESSURE_SLEEP_MS);
+            Sleep(BACKPRESSURE_SLEEP_MS);
 #else
-        usleep(BACKPRESSURE_SLEEP_MS * 1000);
+            usleep(BACKPRESSURE_SLEEP_MS * 1000);
 #endif
+            retry++;
+            if (retry > 600) {
+                /* 30s timeout — force drain and retry one last time */
+                LOG_ERROR("queue stuck for 30s, forcing drain");
+                while (queue_count(&ctx->queue) > 0 && g_running) {
+                    while (flush_one(ctx) > 0) { }
+                    process_ack(ctx);
+#ifdef _WIN32
+                    Sleep(BACKPRESSURE_SLEEP_MS);
+#else
+                    usleep(BACKPRESSURE_SLEEP_MS * 1000);
+#endif
+                }
+                retry = 0;
+            }
+        }
     }
 
     /* 更新 SQLite */
@@ -606,7 +625,8 @@ static int flush_one(migrate_ctx_t *ctx) {
 
 /* 读取器条目: 捆绑读取器及其分区元数据 */
 typedef struct {
-    block_reader_t *reader;
+    block_reader_t *reader;           /* 全量同步读取器 (VSS 或 PhysicalDrive) */
+    block_reader_t *live_reader;      /* 增量同步读取器 (始终 PhysicalDrive) */
     int32_t         devno;             /* 所在物理磁盘编号 */
     uint64_t        partition_offset;  /* 分区在磁盘上的绝对偏移 */
     int             is_vss;            /* 1 = 读取器打开 VSS 快照路径, 0 = PhysicalDrive */
@@ -630,12 +650,17 @@ static void do_retransmit(migrate_ctx_t *ctx, sqlite_db_t *db,
         uint64_t disk_offset = (uint64_t)offsets[i];
         int32_t devno = devnos[i];
 
-        /* 查找对应此 devno 且覆盖此 disk_offset 的读取器 */
+        /* 查找对应此 devno 且覆盖此 disk_offset 的读取器。
+         * VSS 卷内偏移 = disk_offset - partition_offset (卷起始偏移 0 对应分区起始)。
+         * PhysicalDrive 偏移 = disk_offset (绝对磁盘偏移)。 */
         reader_entry_t *entry = NULL;
         uint64_t reader_offset = disk_offset;
         for (int r = 0; r < reader_count; r++) {
             if (readers[r].devno != devno) continue;
-            if (disk_offset >= readers[r].partition_offset) {
+            uint64_t part_end = readers[r].partition_offset
+                              + block_reader_size(readers[r].reader);
+            if (disk_offset >= readers[r].partition_offset
+                && disk_offset < part_end) {
                 entry = &readers[r];
                 reader_offset = entry->is_vss
                     ? (disk_offset - entry->partition_offset)
@@ -643,7 +668,11 @@ static void do_retransmit(migrate_ctx_t *ctx, sqlite_db_t *db,
                 break;
             }
         }
-        if (!entry) continue;
+        if (!entry) {
+            LOG_WARN("retransmit: no reader for devno=%d offset=%llu",
+                     devno, (unsigned long long)disk_offset);
+            continue;
+        }
 
         LOG_INFO("retransmit: devno=%d offset=%lld",
                  devno, (long long)disk_offset);
@@ -670,6 +699,246 @@ static void do_reconnect(migrate_ctx_t *ctx) {
             break;
         }
     }
+}
+
+/*
+ * Fisher-Yates 洗牌: 将前 n 个元素原地随机打乱。
+ * 用于增量同步中随机化未确认块的处理顺序, 避免顺序 I/O。
+ */
+static void shuffle_blocks(int32_t *devnos, int64_t *offsets,
+                           uint64_t *hashes, int64_t *last_sents, int n) {
+    for (int i = n - 1; i > 0; i--) {
+        int j = rand() % (i + 1);
+        /* swap devnos */
+        int32_t tmp_d = devnos[i]; devnos[i] = devnos[j]; devnos[j] = tmp_d;
+        /* swap offsets */
+        int64_t tmp_o = offsets[i]; offsets[i] = offsets[j]; offsets[j] = tmp_o;
+        /* swap hashes */
+        uint64_t tmp_h = hashes[i]; hashes[i] = hashes[j]; hashes[j] = tmp_h;
+        /* swap last_sents */
+        int64_t tmp_l = last_sents[i]; last_sents[i] = last_sents[j]; last_sents[j] = tmp_l;
+    }
+}
+
+/*
+ * 增量同步 — 单轮定时器回调 (18s 间隔)。
+ *
+ * 从 live disk (PhysicalDrive) 重读所有未 ACK 块,
+ * 重新计算 hash 与 T_BLOCK 中存储的旧 hash 比较:
+ *   - hash 相同 → 块未变化, 跳过
+ *   - hash 不同 → 块已变化, 重新压缩发送
+ *
+ * 每块有 121s 冷却期: 同一块在此时间内不会重复重读。
+ *
+ * live_readers: 指向 PhysicalDrive 读取器数组 (用于读 live disk)
+ * vss_readers:  指向原始读取器数组 (用于定位分区)
+ * reader_count: 读取器数量
+ * data_buf:     块读取缓冲区 (≥ 1MB)
+ * db:           SQLite 块跟踪数据库
+ */
+static void do_incremental_round(migrate_ctx_t *ctx,
+                                  reader_entry_t *live_readers,
+                                  reader_entry_t *vss_readers,
+                                  int reader_count,
+                                  sqlite_db_t *db, uint8_t *data_buf) {
+    int32_t  devnos[512];
+    int64_t  offsets[512];
+    uint64_t hashes[512];
+    int64_t  last_sents[512];
+    char remote_id[256];
+    snprintf(remote_id, sizeof(remote_id), "%s:%d",
+             ctx->server_ip, (int)ctx->server_port);
+
+    int count = sqlite_get_unacked_with_hash(db, devnos, offsets,
+                                              hashes, last_sents,
+                                              512, remote_id);
+    if (count <= 0) {
+        LOG_DEBUG("incremental round: no unacked blocks");
+        return;
+    }
+
+    /* Fisher-Yates 随机打乱, 避免顺序 I/O 导致磁盘缓存命中偏差 */
+    shuffle_blocks(devnos, offsets, hashes, last_sents, count);
+
+    int64_t now_ms = (int64_t)timer_now_ms();
+    int requeued = 0;
+
+    for (int i = 0; i < count && g_running; i++) {
+        int32_t  devno      = devnos[i];
+        uint64_t disk_offset = (uint64_t)offsets[i];
+        uint64_t old_hash   = hashes[i];
+        int64_t  last_sent  = last_sents[i];
+
+        /* 121 秒冷却期: 同一块不频繁重读 */
+        if (last_sent > 0 && (now_ms - last_sent) < RETRANSMIT_MIN_INTERVAL_SEC * 1000) {
+            continue;
+        }
+
+        /* 背压: 队列深度过大或内存不足时暂停, 剩余块留待下一轮 */
+        if (queue_count(&ctx->queue) > 9) {
+            LOG_DEBUG("incremental: backpressure (queue=%d), deferring %d blocks",
+                     queue_count(&ctx->queue), count - i);
+            break;
+        }
+
+        /* 查找此 block 对应的 live disk 读取器 */
+        reader_entry_t *entry = NULL;
+        uint64_t reader_offset = disk_offset;
+        for (int r = 0; r < reader_count; r++) {
+            /* 使用 vss_readers 的 partition_offset 做分区匹配 */
+            if (vss_readers[r].devno != devno) continue;
+            uint64_t part_end = vss_readers[r].partition_offset
+                              + block_reader_size(vss_readers[r].reader);
+            if (disk_offset >= vss_readers[r].partition_offset
+                && disk_offset < part_end) {
+                entry = &live_readers[r];
+                /* live disk 读取: 使用绝对磁盘偏移 (不是 VSS 卷内偏移) */
+                reader_offset = disk_offset;
+                break;
+            }
+        }
+        if (!entry) continue;
+
+        /* 使用 live disk reader (始终 PhysicalDrive) 读取块数据 */
+        block_reader_t *live_r = entry->live_reader ? entry->live_reader : entry->reader;
+        if (!live_r) continue;
+
+        uint32_t data_len = 0;
+        if (block_reader_read(live_r, reader_offset, data_buf,
+                              (uint32_t)BLOCK_SIZE, &data_len) != 0) {
+            LOG_WARN("incremental: read live disk failed devno=%d offset=%llu",
+                     devno, (unsigned long long)disk_offset);
+            continue;
+        }
+        if (data_len == 0) continue;
+
+        /* 计算新 hash 并对比 */
+        uint64_t new_hash = hash_block(data_buf, data_len, disk_offset & 0xFFFFFFFF);
+        if (new_hash == old_hash) {
+            /* 块未变化 — 跳过 */
+            continue;
+        }
+
+        LOG_DEBUG("incremental: changed block devno=%d offset=%llu "
+                  "old_hash=0x%016llx new_hash=0x%016llx",
+                  devno, (unsigned long long)disk_offset,
+                  (unsigned long long)old_hash, (unsigned long long)new_hash);
+
+        /* 更新 last_sent 时间戳 (冷却期) */
+        sqlite_update_last_sent(db, devno, (int64_t)disk_offset, now_ms);
+
+        /* MsgPack 编码 → 入队 (带背压重试) */
+        if (msgpack_encode_block(&ctx->mp_writer, devno, (int64_t)disk_offset,
+                                  data_buf, data_len) != 0) {
+            continue;
+        }
+
+        int rc;
+        int retry_count = 0;
+        while ((rc = queue_push(&ctx->queue, devno, (int64_t)disk_offset,
+                                 new_hash, ctx->mp_writer.buf,
+                                 ctx->mp_writer.written)) != 0) {
+            if (!g_running) return;
+            while (flush_one(ctx) > 0) { }
+            process_ack(ctx);
+#ifdef _WIN32
+            Sleep(BACKPRESSURE_SLEEP_MS);
+#else
+            usleep(BACKPRESSURE_SLEEP_MS * 1000);
+#endif
+            if (++retry_count > 300) break;  /* 15s timeout */
+        }
+        if (rc == 0) {
+            /* 更新 SQLite: 新 hash + ack=0 (等待确认) */
+            sqlite_block_upsert(db, devno, (int64_t)disk_offset,
+                                (int32_t)data_len, new_hash, 0);
+            sqlite_update_last_sent(db, devno, (int64_t)disk_offset,
+                                     (int64_t)timer_now_ms());
+            requeued++;
+        }
+    }
+
+    if (requeued > 0) {
+        LOG_INFO("incremental round: %d blocks re-sent (%d total unacked)",
+                 requeued, count);
+    }
+}
+
+/*
+ * timer_cb_real: 检查是否所有块都已确认, 若是则发送 ctlEndIncremental
+ * 并等待服务端 SERVER_DONE, 然后设置 allDone=1。
+ *
+ * 仅在增量模式下调用, 每次增量轮后检查。
+ * 返回 1 表示 allDone (迁移完成), 0 表示继续。
+ */
+static int timer_cb_real(migrate_ctx_t *ctx, sqlite_db_t *db) {
+    char remote_id[256];
+    snprintf(remote_id, sizeof(remote_id), "%s:%d",
+             ctx->server_ip, (int)ctx->server_port);
+
+    /* 检查是否有未确认块 */
+    int unacked = sqlite_count_unacked(db, remote_id);
+    if (unacked > 0) {
+        return 0;  /* 还有块未确认, 继续增量同步 */
+    }
+
+    /* 如果 ctlEndIncremental 已发送且服务端已回复 SERVER_DONE */
+    if (ctx->all_done) {
+        return 1;  /* 已完成 */
+    }
+
+    /* 排空队列: 确保所有块都已发送 */
+    while (queue_count(&ctx->queue) > 0 && g_running) {
+        while (flush_one(ctx) > 0) { }
+        process_ack(ctx);
+#ifdef _WIN32
+        Sleep(50);
+#else
+        usleep(50000);
+#endif
+    }
+
+    /* 再次确认: 排空后可能还有未确认块 */
+    unacked = sqlite_count_unacked(db, remote_id);
+    if (unacked > 0) {
+        return 0;
+    }
+
+    /* 发送 ctlEndIncremental */
+    if (!ctx->ctl_end_sent) {
+        pool_conn_t *c = pool_acquire(&ctx->pool);
+        if (c) {
+            wire_send_control(c->fd, CTL_END_INCREMENTAL, CTL_END_INCREMENTAL_LEN);
+            pool_touch(c);
+            pool_release(&ctx->pool, c);
+            ctx->ctl_end_sent = 1;
+            LOG_INFO("sent ctlEndIncremental");
+        } else {
+            return 0;
+        }
+    }
+
+    /* 等待 SERVER_DONE (轮询, 最多 300 秒, 提前终止条件: server_done_rcvd) */
+    LOG_INFO("waiting for SERVER_DONE...");
+    ctx->server_done_rcvd = 0;
+    for (int w = 0; w < 3000 && g_running && !ctx->server_done_rcvd; w++) {
+        process_ack(ctx);
+        /* 排空任何残留的发送 */
+        while (flush_one(ctx) > 0) { }
+#ifdef _WIN32
+        Sleep(100);
+#else
+        usleep(100000);
+#endif
+    }
+
+    if (!ctx->server_done_rcvd) {
+        LOG_WARN("SERVER_DONE wait timed out (300s), proceeding anyway");
+    }
+
+    ctx->all_done = 1;
+    LOG_INFO("allDone set, migration complete");
+    return 1;
 }
 
 /*
@@ -794,10 +1063,41 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
             entry->devno            = vol->devno;
             entry->partition_offset = vol->partition_offset;
             entry->is_vss           = use_vss;
+            entry->live_reader      = NULL;
+
+            /* 打开 PhysicalDrive 读取器用于增量同步 (始终从 live disk 读取)。
+             * VSS 快照是静态的时间点副本, 无法检测后续写入变化。 */
+            if (ctx->tail_send) {
+                entry->live_reader = block_reader_open(vol->disk_path);
+                if (!entry->live_reader) {
+                    LOG_WARN("cannot open live disk %s for incremental sync, "
+                             "using primary reader as fallback", vol->disk_path);
+                    entry->live_reader = r;  /* fallback to primary reader */
+                }
+            }
+
             reader_count++;
-            LOG_INFO("partition %s: %llu blocks via %s",
+
+            /* Runtime consistency: VSS snapshot size should match partition.
+             * On mismatch, clamp block_count to the smaller of the two. */
+            uint64_t reader_blocks = block_reader_block_count(r, (uint32_t)BLOCK_SIZE);
+            uint64_t vol_blocks    = vol->block_count;
+            if (reader_blocks != vol_blocks) {
+                LOG_WARN("partition %s: volume block_count=%llu reader block_count=%llu "
+                         "(using smaller)", vol->name,
+                         (unsigned long long)vol_blocks,
+                         (unsigned long long)reader_blocks);
+                if (reader_blocks < vol_blocks) {
+                    /* VSS snapshot smaller than expected — clamp to reader size */
+                    vol->block_count = reader_blocks;
+                }
+            }
+
+            LOG_INFO("partition %s: %llu blocks (offset=%llu) via %s%s",
                      vol->name, (unsigned long long)vol->block_count,
-                     use_vss ? "VSS" : "PhysicalDrive");
+                     (unsigned long long)vol->partition_offset,
+                     use_vss ? "VSS" : "PhysicalDrive",
+                     ctx->tail_send ? " (+ live reader)" : "");
         }
     }
 
@@ -925,9 +1225,76 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
     }
 
     /* ================================================================
-     * 增量模式: 发送 ctlEndIncremental, 等待 SERVER_DONE
+     * 增量同步循环 (TailSend=1)
+     *
+     * 每 18s 从 live disk (PhysicalDrive) 重读所有未 ACK 块,
+     * hash 对比, 仅重发变化的块。
+     * 当所有块已确认且服务端返回 SERVER_DONE 后退出。
      * ================================================================ */
     if (ctx->tail_send) {
+        LOG_INFO("entering incremental sync loop (interval=%d ms)",
+                 RETRANSMIT_TIMER_MS);
+
+        /* 重置增量定时器: 全量同步完成后 18s 开始第一轮增量 */
+        ctx->timer.last_fire[TIMER_INCREMENTAL] = timer_now_ms();
+
+        while (g_running && !ctx->all_done) {
+            /* 发送 + 接收 + 定时器处理 */
+            while (flush_one(ctx) > 0) { }
+            process_ack(ctx);
+            do_reconnect(ctx);
+
+            uint64_t now = timer_now_ms();
+            timer_event_t ev;
+            while ((ev = timer_check(&ctx->timer, now)) != TIMER_NONE) {
+                switch (ev) {
+                case TIMER_INCREMENTAL:
+                    do_incremental_round(ctx, readers, readers,
+                                         reader_count, db, data_buf);
+                    break;
+                case TIMER_RETRANSMIT:
+                    do_retransmit(ctx, db, readers, reader_count, data_buf);
+                    break;
+                case TIMER_RECONNECT:
+                    do_reconnect(ctx);
+                    break;
+                case TIMER_ACTION:
+                    LOG_INFO("incremental: %d unacked blocks, queue=%d",
+                             sqlite_count_unacked(db, remote_id),
+                             queue_count(&ctx->queue));
+                    break;
+                default:
+                    break;
+                }
+                timer_reset(&ctx->timer, ev);
+
+                /* 每轮增量后检查 allDone */
+                if (ev == TIMER_INCREMENTAL) {
+                    if (timer_cb_real(ctx, db)) {
+                        break;  /* allDone — 退出定时器循环 */
+                    }
+                }
+                now = timer_now_ms();
+            }
+
+            /* allDone 检查 */
+            if (ctx->all_done) break;
+
+            /* 短暂休眠避免忙等 (1s) */
+#ifdef _WIN32
+            Sleep(1000);
+#else
+            usleep(1000000);
+#endif
+        }
+
+        /* 清理块跟踪表 (原始行为: allDone=1 → DELETE FROM T_BLOCK → exit) */
+        if (ctx->all_done) {
+            LOG_INFO("incremental sync complete, clearing T_BLOCK");
+            sqlite_clear_all_blocks(db);
+        }
+    } else {
+        /* 非增量模式: 发送 ctlEndIncremental 结束传输 */
         pool_conn_t *c = pool_acquire(&ctx->pool);
         if (c) {
             wire_send_control(c->fd, CTL_END_INCREMENTAL, CTL_END_INCREMENTAL_LEN);
@@ -960,6 +1327,10 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
     /* 清理 */
     for (int i = 0; i < reader_count; i++) {
         block_reader_close(readers[i].reader);
+        /* 关闭 live reader (如果不同于 primary reader) */
+        if (readers[i].live_reader && readers[i].live_reader != readers[i].reader) {
+            block_reader_close(readers[i].live_reader);
+        }
     }
     free(data_buf);
     sqlite_close(db);
@@ -1141,6 +1512,9 @@ int main(int argc, char *argv[]) {
     /* 注册信号处理 */
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
+
+    /* 随机数种子 (用于增量同步 Fisher-Yates 洗牌) */
+    srand((unsigned int)time(NULL));
 
     /* 执行迁移 */
     int rc = do_migrate(&ctx, &vol_list);
