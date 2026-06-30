@@ -87,6 +87,12 @@ int sqlite_get_unacked(sqlite_db_t *db,
                        int max_entries, const char *remote_id);
 
 /*
+ * 查询已确认块的总字节数 (ack=1)。
+ * 用于跨进程进度查询 (sentbytes 子命令)。
+ */
+int64_t sqlite_total_acked_bytes(sqlite_db_t *db);
+
+/*
  * 删除 T_BLOCK 表中所有记录。
  * 返回 0 成功, -1 失败。
  */

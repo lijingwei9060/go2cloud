@@ -94,6 +94,24 @@ void sqlite_close(sqlite_db_t *db) {
     }
 }
 
+int64_t sqlite_total_acked_bytes(sqlite_db_t *db) {
+    sqlite3_stmt *stmt = NULL;
+    const char *sql = "SELECT COALESCE(SUM(size), 0) FROM T_BLOCK WHERE ack=1";
+    int rc = sqlite3_prepare_v2(db->handle, sql, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        LOG_ERROR("sqlite_total_acked: prepare failed: %s", sqlite3_errmsg(db->handle));
+        return -1;
+    }
+
+    int64_t total = 0;
+    rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+        total = sqlite3_column_int64(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    return total;
+}
+
 int sqlite_clear_all_blocks(sqlite_db_t *db) {
     char *err = NULL;
     int rc = sqlite3_exec(db->handle, "DELETE FROM T_BLOCK", NULL, NULL, &err);
