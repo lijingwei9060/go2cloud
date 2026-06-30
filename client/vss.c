@@ -56,9 +56,14 @@ vss_context_t *vss_init(void) {
     }
 
     g_pfn_create = (PFN_CreateVssBackupComponents)
-        GetProcAddress(ctx->vssapi_dll, "CreateVssBackupComponents");
+        GetProcAddress(ctx->vssapi_dll, "CreateVssBackupComponentsInternal");
     if (!g_pfn_create) {
-        LOG_ERROR("vss_init: GetProcAddress(CreateVssBackupComponents) failed");
+        /* 回退: 某些 SDK 版本导出为 CreateVssBackupComponents */
+        g_pfn_create = (PFN_CreateVssBackupComponents)
+            GetProcAddress(ctx->vssapi_dll, "CreateVssBackupComponents");
+    }
+    if (!g_pfn_create) {
+        LOG_ERROR("vss_init: GetProcAddress(CreateVssBackupComponentsInternal) failed");
         FreeLibrary(ctx->vssapi_dll);
         free(ctx);
         return NULL;

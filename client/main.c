@@ -221,6 +221,35 @@ static int cmd_sentbytes(const char *db_path) {
 }
 
 /* ================================================================
+ * 子命令: test_vss — 验证 VSS 快照功能
+ * ================================================================ */
+
+static int cmd_test_vss(void) {
+    vss_context_t *ctx = vss_init();
+    if (!ctx) {
+        printf("VSS init failed\n");
+        return 1;
+    }
+
+    const char *volumes[] = {"C:", NULL};
+    vss_snapshot_t snaps[VSS_MAX_VOLUMES];
+    memset(snaps, 0, sizeof(snaps));
+
+    int n = vss_create_snapshots(ctx, volumes, snaps);
+    if (n <= 0) {
+        printf("Snapshot creation failed\n");
+        vss_cleanup(ctx);
+        return 1;
+    }
+
+    printf("Using VSS volume: %s\n", snaps[0].snapshot_path);
+
+    vss_backup_complete(ctx);
+    vss_cleanup(ctx);
+    return 0;
+}
+
+/* ================================================================
  * 子命令: isbios — 检测固件类型 (UEFI / Legacy)
  * ================================================================ */
 
@@ -903,6 +932,7 @@ int main(int argc, char *argv[]) {
         printf("  %s begin_session              Mark migration session start\n", argv[0]);
         printf("  %s end_session                Clean block tracking database\n", argv[0]);
         printf("  %s sentbytes                  Print total confirmed bytes\n", argv[0]);
+        printf("  %s test_vss                   Test VSS snapshot functionality\n", argv[0]);
         printf("  %s --help                     Show this help\n", argv[0]);
         return 0;
     }
@@ -918,6 +948,7 @@ int main(int argc, char *argv[]) {
         printf("  %s begin_session\n", argv[0]);
         printf("  %s end_session\n", argv[0]);
         printf("  %s sentbytes\n", argv[0]);
+        printf("  %s test_vss\n", argv[0]);
         printf("\nConfig file defaults to user.json\n");
         return 0;
     }
@@ -946,6 +977,9 @@ int main(int argc, char *argv[]) {
     }
     if (strcmp(argv[1], "sentbytes") == 0) {
         return cmd_sentbytes("tracker.db");
+    }
+    if (strcmp(argv[1], "test_vss") == 0) {
+        return cmd_test_vss();
     }
 
     /* ————— 迁移模式 ————— */
