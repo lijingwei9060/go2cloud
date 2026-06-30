@@ -36,7 +36,7 @@ struct vss_context {
     int                  snapshot_set_started;
 };
 
-/* 动态加载的函数指针 (保持与原工具一致的延迟加载方式) */
+/* 动态加载的函数指针 */
 typedef HRESULT (WINAPI *PFN_CreateVssBackupComponents)(
     IVssBackupComponents **ppBackup);
 
@@ -58,7 +58,6 @@ vss_context_t *vss_init(void) {
     g_pfn_create = (PFN_CreateVssBackupComponents)
         GetProcAddress(ctx->vssapi_dll, "CreateVssBackupComponentsInternal");
     if (!g_pfn_create) {
-        /* 回退: 某些 SDK 版本导出为 CreateVssBackupComponents */
         g_pfn_create = (PFN_CreateVssBackupComponents)
             GetProcAddress(ctx->vssapi_dll, "CreateVssBackupComponents");
     }
@@ -69,8 +68,8 @@ vss_context_t *vss_init(void) {
         return NULL;
     }
 
-    /* 初始化 COM (多线程) */
-    HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    /* 初始化 COM (单线程公寓 — VSS 要求 STA) */
+    HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
         LOG_ERROR("vss_init: CoInitializeEx failed: 0x%lx", (unsigned long)hr);
         FreeLibrary(ctx->vssapi_dll);
@@ -99,18 +98,6 @@ vss_context_t *vss_init(void) {
         FreeLibrary(ctx->vssapi_dll);
         free(ctx);
         return NULL;
-    }
-
-    /* 设置为选择组件模式 */
-    hr = ctx->backup_components->SetBackupState(
-        TRUE,   /* 选择组件 */
-        FALSE,  /* 不是 BootableSystemState */
-        VSS_BT_COPY,  /* 拷贝备份 (不截断日志) */
-        FALSE   /* 不部分文件支持 */
-    );
-    if (FAILED(hr)) {
-        LOG_WARN("vss_init: SetBackupState failed: 0x%lx", (unsigned long)hr);
-        /* 非致命, 继续 */
     }
 
     ctx->initialized = 1;
@@ -144,14 +131,25 @@ int vss_create_snapshots(vss_context_t *ctx,
     HRESULT hr;
     int snapshot_count = 0;
 
-    /* 第 4 步: 收集写入器元数据 */
-    hr = bc->GatherWriterMetadata(NULL);
+    /* SetBackupState — 必须在 GatherWriterMetadata 之前 */
+    hr = bc->SetBackupState(FALSE, FALSE, VSS_BT_COPY, FALSE);
     if (FAILED(hr)) {
-        LOG_WARN("vss: GatherWriterMetadata failed: 0x%lx", (unsigned long)hr);
-        /* 非致命: 可能无写入器, 继续 */
+        LOG_ERROR("vss: SetBackupState failed: 0x%lx", (unsigned long)hr);
+        return -1;
     }
 
-    /* 第 5-6 步: 启动快照集 */
+    /* GatherWriterMetadata */
+    IVssAsync *gather_async = NULL;
+    hr = bc->GatherWriterMetadata(&gather_async);
+    if (FAILED(hr)) {
+        LOG_WARN("vss: GatherWriterMetadata failed: 0x%lx", (unsigned long)hr);
+    }
+    if (gather_async) {
+        gather_async->Wait(30000);
+        gather_async->Release();
+    }
+
+    /* StartSnapshotSet */
     VSS_ID snapshot_set_id;
     hr = bc->StartSnapshotSet(&snapshot_set_id);
     if (FAILED(hr)) {
@@ -160,12 +158,11 @@ int vss_create_snapshots(vss_context_t *ctx,
     }
     ctx->snapshot_set_started = 1;
 
-    /* 第 7 步: 为每个卷添加到快照集 */
+    /* AddToSnapshotSet */
     VSS_ID snapshot_ids[VSS_MAX_VOLUMES];
     int added_count = 0;
 
     for (int i = 0; i < VSS_MAX_VOLUMES && volumes[i] != NULL; i++) {
-        /* 将卷路径转为宽字符 */
         WCHAR wide_vol[64];
         MultiByteToWideChar(CP_ACP, 0, volumes[i], -1, wide_vol, 64);
 
@@ -187,52 +184,60 @@ int vss_create_snapshots(vss_context_t *ctx,
         return -1;
     }
 
-    /* 第 8 步: 设置为备份状态 */
-    bc->SetBackupState(FALSE, FALSE, VSS_BT_COPY, FALSE);
-
-    /* 第 9 步: 准备备份 (异步, 最长 30 秒) */
-    IVssAsync *async_op = NULL;
-    hr = bc->PrepareForBackup(&async_op);
+    /* PrepareForBackup */
+    IVssAsync *prepare_async = NULL;
+    hr = bc->PrepareForBackup(&prepare_async);
     if (FAILED(hr)) {
         LOG_ERROR("vss: PrepareForBackup failed: 0x%lx", (unsigned long)hr);
         return -1;
     }
-
-    if (async_op) {
-        async_op->Wait(30000);  /* 30 秒超时 */
-        async_op->Release();
+    if (prepare_async) {
+        prepare_async->Wait(30000);
+        prepare_async->Release();
     }
 
-    /* 第 10 步: 执行快照 */
-    hr = bc->DoSnapshotSet(NULL);
+    /* DoSnapshotSet */
+    IVssAsync *do_async = NULL;
+    hr = bc->DoSnapshotSet(&do_async);
     if (FAILED(hr)) {
         LOG_ERROR("vss: DoSnapshotSet failed: 0x%lx", (unsigned long)hr);
         return -1;
+    }
+    if (do_async) {
+        do_async->Wait(0xFFFFFFFF);
+        do_async->Release();
     }
 
     LOG_INFO("vss: snapshot set created (%d volumes), querying properties...",
              added_count);
 
-    /* 第 11 步: 查询快照属性 */
+    /* 查询快照属性 (带重试, 匹配原始) */
     for (int i = 0; i < added_count; i++) {
         VSS_SNAPSHOT_PROP snapshot_prop;
+        memset(&snapshot_prop, 0, sizeof(snapshot_prop));
+
+        int retry = 0;
         hr = bc->GetSnapshotProperties(snapshot_ids[i], &snapshot_prop);
+        while (FAILED(hr) && retry < 20) {
+            Sleep(10);
+            hr = bc->GetSnapshotProperties(snapshot_ids[i], &snapshot_prop);
+            retry++;
+        }
+
         if (FAILED(hr)) {
-            LOG_WARN("vss: GetSnapshotProperties failed for snapshot %d", i);
+            LOG_WARN("vss: GetSnapshotProperties failed for snapshot %d (0x%lx)",
+                     i, (unsigned long)hr);
             continue;
         }
 
-        /* 保存快照信息 */
         vss_snapshot_t *snap = &snapshots[snapshot_count];
         memset(snap, 0, sizeof(*snap));
 
-        /* 原始卷名 (宽 → 窄) */
         WideCharToMultiByte(CP_ACP, 0,
                             snapshot_prop.m_pwszOriginalVolumeName, -1,
                             snap->original_volume,
                             sizeof(snap->original_volume), NULL, NULL);
 
-        /* 快照设备路径 */
         WideCharToMultiByte(CP_ACP, 0,
                             snapshot_prop.m_pwszSnapshotDeviceObject, -1,
                             snap->snapshot_path,
@@ -244,9 +249,7 @@ int vss_create_snapshots(vss_context_t *ctx,
         LOG_INFO("vss: snapshot[%d] %s → %s",
                  snapshot_count, snap->original_volume, snap->snapshot_path);
 
-        /* 释放快照属性 */
         VssFreeSnapshotProperties(&snapshot_prop);
-
         snapshot_count++;
     }
 

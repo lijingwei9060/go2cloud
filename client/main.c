@@ -231,7 +231,7 @@ static int cmd_test_vss(void) {
         return 1;
     }
 
-    const char *volumes[] = {"C:", NULL};
+    const char *volumes[] = {"C:\\", NULL};
     vss_snapshot_t snaps[VSS_MAX_VOLUMES];
     memset(snaps, 0, sizeof(snaps));
 
