@@ -45,11 +45,11 @@ client.exe <server_ip:port> [config.json]
 client.exe info
 ```
 
-枚举所有固定磁盘上的分区，按盘符（如果有）和组织名称显示。输出格式：
+枚举所有固定磁盘上的分区，按盘符（如果有）和组织名称显示。每个条目是一个卷/分区（非物理磁盘），`Disk` 列表示所在物理磁盘编号。输出格式：
 
 ```
-Disk Information:
-DevNo  Size(GB) TotalBlocks      Name             DiskPath
+Volume Information:
+Disk   Size(GB) TotalBlocks      Name             DiskPath
 ------ -------- ---------------- ---------------- ----
 0      50.00    51200            C:               \\.\PhysicalDrive0
 0      0.53     544              Disk0Part3       \\.\PhysicalDrive0

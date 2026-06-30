@@ -173,8 +173,8 @@ static int cmd_info(void) {
         return 1;
     }
 
-    printf("Disk Information:\n");
-    printf("%-6s %-8s %-16s %-16s %s\n", "DevNo", "Size(GB)", "TotalBlocks", "Name", "DiskPath");
+    printf("Volume Information:\n");
+    printf("%-6s %-8s %-16s %-16s %s\n", "Disk", "Size(GB)", "TotalBlocks", "Name", "DiskPath");
     printf("------ ------ ---------------- ---------------- ----\n");
 
     for (int i = 0; i < vol_list.count; i++) {
