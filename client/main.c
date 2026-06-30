@@ -151,6 +151,7 @@ typedef struct {
     int           skip_count;
     int           tail_send;         /* 是否尾随发送模式 */
     char          db_path[512];      /* SQLite 数据库路径 */
+    sqlite_db_t  *db;                /* 块跟踪数据库 (用于 ACK 持久化) */
     socket_pool_t pool;              /* 连接池 */
     send_queue_t  queue;             /* 发送队列 */
     timer_mgr_t   timer;             /* 定时器 */
@@ -285,8 +286,11 @@ static void process_ack(migrate_ctx_t *ctx) {
             if (resp.type == RESPONSE_ACK || resp.type == RESPONSE_ACK_ALT) {
                 LOG_DEBUG("ACK: devno=%d offset=%lld size=%d",
                           resp.devno, (long long)resp.offset, resp.size);
-                /* 从队列标记确认 */
                 queue_ack(&ctx->queue, resp.devno, resp.offset);
+                /* 持久化 ACK 到 SQLite，支持崩溃恢复 */
+                if (ctx->db) {
+                    sqlite_block_mark_acked(ctx->db, resp.devno, resp.offset);
+                }
             } else if (resp.type == RESPONSE_SERVER_DONE) {
                 LOG_INFO("SERVER_DONE: incremental round complete");
                 /* 增量轮次结束 — 可以开始下一轮 */
@@ -322,6 +326,13 @@ static int send_block(migrate_ctx_t *ctx, block_reader_t *reader,
 
     if (data_len == 0) {
         return 0; /* EOF */
+    }
+
+    /* 崩溃恢复: 如果此块已 ACK (上次会话遗留), 跳过 */
+    if (sqlite_block_acked(db, devno, (int64_t)disk_offset) == 1) {
+        LOG_DEBUG("skip acked: devno=%d offset=%llu (recovered from prior session)",
+                  devno, (unsigned long long)disk_offset);
+        return 0;
     }
 
     /* 计算哈希 (使用 disk_offset 的低 32 位作为种子的组成部分) */
@@ -490,6 +501,7 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
         LOG_ERROR("cannot open tracking database: %s", ctx->db_path);
         return -1;
     }
+    ctx->db = db;  /* 挂到 ctx 上, process_ack 需要持久化 ACK */
     char remote_id[256];
     snprintf(remote_id, sizeof(remote_id), "%s:%d",
              ctx->server_ip, (int)ctx->server_port);
