@@ -87,6 +87,12 @@ int sqlite_get_unacked(sqlite_db_t *db,
                        int max_entries, const char *remote_id);
 
 /*
+ * 删除 T_BLOCK 表中所有记录。
+ * 返回 0 成功, -1 失败。
+ */
+int sqlite_clear_all_blocks(sqlite_db_t *db);
+
+/*
  * 设置当前会话的 remote_id (用于多会话区分)。
  */
 void sqlite_set_remote_id(sqlite_db_t *db, const char *remote_id);

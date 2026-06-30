@@ -189,6 +189,21 @@ static int cmd_info(void) {
 }
 
 /* ================================================================
+ * 子命令: end_session — 清理块跟踪数据
+ * ================================================================ */
+
+static int cmd_end_session(const char *db_path) {
+    sqlite_db_t *db = sqlite_open(db_path);
+    if (!db) {
+        printf("cannot open database: %s\n", db_path);
+        return 1;
+    }
+    int rc = sqlite_clear_all_blocks(db);
+    sqlite_close(db);
+    return rc == 0 ? 0 : 1;
+}
+
+/* ================================================================
  * 子命令: isbios — 检测固件类型 (UEFI / Legacy)
  * ================================================================ */
 
@@ -869,6 +884,7 @@ int main(int argc, char *argv[]) {
         printf("  %s check <disk>               Check disk accessibility\n", argv[0]);
         printf("  %s isbios                     Detect firmware type (UEFI/Legacy)\n", argv[0]);
         printf("  %s begin_session              Mark migration session start\n", argv[0]);
+        printf("  %s end_session                Clean block tracking database\n", argv[0]);
         printf("  %s --help                     Show this help\n", argv[0]);
         return 0;
     }
@@ -882,6 +898,7 @@ int main(int argc, char *argv[]) {
         printf("  %s check <disk>\n", argv[0]);
         printf("  %s isbios\n", argv[0]);
         printf("  %s begin_session\n", argv[0]);
+        printf("  %s end_session\n", argv[0]);
         printf("\nConfig file defaults to user.json\n");
         return 0;
     }
@@ -904,6 +921,9 @@ int main(int argc, char *argv[]) {
     }
     if (strcmp(argv[1], "isbios") == 0) {
         return cmd_isbios();
+    }
+    if (strcmp(argv[1], "end_session") == 0) {
+        return cmd_end_session("tracker.db");
     }
 
     /* ————— 迁移模式 ————— */

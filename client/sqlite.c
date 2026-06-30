@@ -94,6 +94,18 @@ void sqlite_close(sqlite_db_t *db) {
     }
 }
 
+int sqlite_clear_all_blocks(sqlite_db_t *db) {
+    char *err = NULL;
+    int rc = sqlite3_exec(db->handle, "DELETE FROM T_BLOCK", NULL, NULL, &err);
+    if (rc != SQLITE_OK) {
+        LOG_ERROR("sqlite_clear_all: %s", err);
+        sqlite3_free(err);
+        return -1;
+    }
+    LOG_INFO("sqlite: T_BLOCK cleared");
+    return 0;
+}
+
 void sqlite_set_remote_id(sqlite_db_t *db, const char *remote_id) {
     if (db && remote_id) {
         strncpy(db->remote_id, remote_id, sizeof(db->remote_id) - 1);
