@@ -172,16 +172,16 @@ static int cmd_info(void) {
     }
 
     printf("Disk Information:\n");
-    printf("%-6s %-8s %-16s %s\n", "DevNo", "Size(GB)", "TotalBlocks(1MB)", "Path");
-    printf("------ ------ ---------------- ----\n");
+    printf("%-6s %-8s %-16s %-16s %s\n", "DevNo", "Size(GB)", "TotalBlocks", "Name", "DiskPath");
+    printf("------ ------ ---------------- ---------------- ----\n");
 
     for (int i = 0; i < vol_list.count; i++) {
         volume_info_t *v = &vol_list.volumes[i];
-        printf("%-6d %-8.2f %-16llu %s\n",
+        printf("%-6d %-8.2f %-16llu %-16s %s\n",
                v->devno,
                (double)v->total_bytes / (1024.0 * 1024.0 * 1024.0),
                (unsigned long long)v->block_count,
-               v->path);
+               v->name, v->disk_path);
     }
     return 0;
 }
@@ -301,16 +301,22 @@ static void process_ack(migrate_ctx_t *ctx) {
 /*
  * 发送一个块。
  * 流程: 读取 → 哈希 → 去重检查 → 编码 → 入队 → 发送
+ *
+ * disk_offset:   物理磁盘上的绝对字节偏移 (用于协议/SQLite)
+ * reader_offset: 读取器上的字节偏移 (VSS 读取器为卷内偏移,
+ *                 PhysicalDrive 读取器为绝对偏移)
  */
 static int send_block(migrate_ctx_t *ctx, block_reader_t *reader,
-                      sqlite_db_t *db, int32_t devno, uint64_t offset,
+                      sqlite_db_t *db, int32_t devno,
+                      uint64_t disk_offset, uint64_t reader_offset,
                       uint8_t *data_buf) {
 
     uint32_t data_len = 0;
-    if (block_reader_read(reader, offset, data_buf,
+    if (block_reader_read(reader, reader_offset, data_buf,
                           (uint32_t)BLOCK_SIZE, &data_len) != 0) {
-        LOG_ERROR("read block failed: devno=%d offset=%llu",
-                  devno, (unsigned long long)offset);
+        LOG_ERROR("read block failed: devno=%d disk_offset=%llu reader_offset=%llu",
+                  devno, (unsigned long long)disk_offset,
+                  (unsigned long long)reader_offset);
         return -1;
     }
 
@@ -318,16 +324,16 @@ static int send_block(migrate_ctx_t *ctx, block_reader_t *reader,
         return 0; /* EOF */
     }
 
-    /* 计算哈希 */
-    uint64_t h = hash_block(data_buf, data_len, offset & 0xFFFFFFFF);
+    /* 计算哈希 (使用 disk_offset 的低 32 位作为种子的组成部分) */
+    uint64_t h = hash_block(data_buf, data_len, disk_offset & 0xFFFFFFFF);
 
     /* 增量去重: 查询 SQLite */
     if (ctx->zstd_level > 0) {  /* 仅增量模式下查询 */
         uint64_t stored_hash = 0;
-        if (sqlite_block_lookup(db, devno, (int64_t)offset, &stored_hash) == 0) {
+        if (sqlite_block_lookup(db, devno, (int64_t)disk_offset, &stored_hash) == 0) {
             if (stored_hash == h) {
                 LOG_DEBUG("skip: devno=%d offset=%llu (hash unchanged 0x%016llx)",
-                          devno, (unsigned long long)offset,
+                          devno, (unsigned long long)disk_offset,
                           (unsigned long long)h);
                 return 0; /* 跳过未变化的块 */
             }
@@ -335,25 +341,25 @@ static int send_block(migrate_ctx_t *ctx, block_reader_t *reader,
     }
 
     /* MsgPack 编码 */
-    if (msgpack_encode_block(&ctx->mp_writer, devno, (int64_t)offset,
+    if (msgpack_encode_block(&ctx->mp_writer, devno, (int64_t)disk_offset,
                               data_buf, data_len) != 0) {
         LOG_ERROR("msgpack encode failed: devno=%d offset=%llu",
-                  devno, (unsigned long long)offset);
+                  devno, (unsigned long long)disk_offset);
         return -1;
     }
 
     /* 入队 */
-    int rc = queue_push(&ctx->queue, devno, (int64_t)offset, h,
+    int rc = queue_push(&ctx->queue, devno, (int64_t)disk_offset, h,
                         ctx->mp_writer.buf, ctx->mp_writer.written);
     if (rc == -1) {
         LOG_WARN("queue full, block %d:%llu dropped", devno,
-                 (unsigned long long)offset);
+                 (unsigned long long)disk_offset);
         return -1;
     }
     if (rc == 2) {
         /* 背压 — 等待队列排空 */
         LOG_DEBUG("backpressure at block %d:%llu", devno,
-                  (unsigned long long)offset);
+                  (unsigned long long)disk_offset);
 #ifdef _WIN32
         Sleep(BACKPRESSURE_SLEEP_MS);
 #else
@@ -362,7 +368,7 @@ static int send_block(migrate_ctx_t *ctx, block_reader_t *reader,
     }
 
     /* 更新 SQLite */
-    sqlite_block_upsert(db, devno, (int64_t)offset,
+    sqlite_block_upsert(db, devno, (int64_t)disk_offset,
                         (int32_t)data_len, h, 0);
 
     return 0;
@@ -406,12 +412,20 @@ static int flush_one(migrate_ctx_t *ctx) {
     return 1;
 }
 
+/* 读取器条目: 捆绑读取器及其分区元数据 */
+typedef struct {
+    block_reader_t *reader;
+    int32_t         devno;             /* 所在物理磁盘编号 */
+    uint64_t        partition_offset;  /* 分区在磁盘上的绝对偏移 */
+    int             is_vss;            /* 1 = 读取器打开 VSS 快照路径, 0 = PhysicalDrive */
+} reader_entry_t;
+
 /*
- * 处理重传: 扫描 SQLite 中未 ACK 的块, 和队列中待发送的块,
- * 对超过最小间隔的块进行重传。
+ * 处理重传: 扫描 SQLite 中未 ACK 的块, 对超时的块进行重传。
  */
 static void do_retransmit(migrate_ctx_t *ctx, sqlite_db_t *db,
-                          block_reader_t *reader, uint8_t *data_buf) {
+                          reader_entry_t *readers, int reader_count,
+                          uint8_t *data_buf) {
     int32_t  devnos[256];
     int64_t  offsets[256];
     int count = sqlite_get_unacked(db, devnos, offsets, 256, "");
@@ -421,15 +435,28 @@ static void do_retransmit(migrate_ctx_t *ctx, sqlite_db_t *db,
     for (int i = 0; i < count; i++) {
         if (!g_running) break;
 
-        /* 检查是否已在队列中 */
-        int in_queue = 0;
-        queue_entry_t entry;
-        /* (简化: 不检查队列 — 已 ACK 的块在 queue_ack 中标记 pending=0,
-         *         未 ACK 且不在队列中的块需要重新读取并重传) */
+        uint64_t disk_offset = (uint64_t)offsets[i];
+        int32_t devno = devnos[i];
+
+        /* 查找对应此 devno 且覆盖此 disk_offset 的读取器 */
+        reader_entry_t *entry = NULL;
+        uint64_t reader_offset = disk_offset;
+        for (int r = 0; r < reader_count; r++) {
+            if (readers[r].devno != devno) continue;
+            if (disk_offset >= readers[r].partition_offset) {
+                entry = &readers[r];
+                reader_offset = entry->is_vss
+                    ? (disk_offset - entry->partition_offset)
+                    : disk_offset;
+                break;
+            }
+        }
+        if (!entry) continue;
 
         LOG_INFO("retransmit: devno=%d offset=%lld",
-                 devnos[i], (long long)offsets[i]);
-        send_block(ctx, reader, db, devnos[i], (uint64_t)offsets[i], data_buf);
+                 devno, (long long)disk_offset);
+        send_block(ctx, entry->reader, db, devno,
+                   disk_offset, reader_offset, data_buf);
     }
 }
 
@@ -463,7 +490,6 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
         LOG_ERROR("cannot open tracking database: %s", ctx->db_path);
         return -1;
     }
-    /* 使用服务端 IP:port 作为 remote_id */
     char remote_id[256];
     snprintf(remote_id, sizeof(remote_id), "%s:%d",
              ctx->server_ip, (int)ctx->server_port);
@@ -477,9 +503,72 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
         return -1;
     }
 
-    /* 为每个磁盘打开读取器 */
-    block_reader_t *readers[MAX_VOLUMES] = { NULL };
+    /* ================================================================
+     * VSS 快照初始化
+     * ================================================================ */
+    vss_context_t *vss_ctx = vss_init();
+    if (vss_ctx) {
+        LOG_INFO("VSS subsystem initialized for consistent backup");
+    }
+
+    /* 构建 VSS 卷列表 (仅带盘符的分区) */
+    const char *vss_volumes[VSS_MAX_VOLUMES + 1];
+    int vss_vol_indices[VSS_MAX_VOLUMES];  /* vol_list 中的索引 */
+    int vss_vol_count = 0;
+
+    for (int i = 0; i < vol_list->count && vss_vol_count < VSS_MAX_VOLUMES; i++) {
+        volume_info_t *v = &vol_list->volumes[i];
+        if (v->name[0] && v->name[1] == ':') {
+            vss_volumes[vss_vol_count] = v->name;
+            vss_vol_indices[vss_vol_count] = i;
+            vss_vol_count++;
+        }
+    }
+    vss_volumes[vss_vol_count] = NULL;
+
+    /* 创建 VSS 快照 */
+    vss_snapshot_t snapshots[VSS_MAX_VOLUMES];
+    memset(snapshots, 0, sizeof(snapshots));
+    int snap_count = 0;
+
+    if (vss_ctx && vss_vol_count > 0) {
+        snap_count = vss_create_snapshots(vss_ctx, vss_volumes, snapshots);
+        LOG_INFO("VSS: %d snapshots created", snap_count);
+
+        /* 将快照路径匹配到 vol_list */
+        for (int s = 0; s < snap_count; s++) {
+            if (!snapshots[s].valid) continue;
+
+            /* original_volume 格式如 "C:\" — 去掉尾部反斜杠 */
+            size_t orig_len = strlen(snapshots[s].original_volume);
+            if (orig_len > 0 && snapshots[s].original_volume[orig_len - 1] == '\\')
+                orig_len--;
+
+            for (int vi = 0; vi < vss_vol_count; vi++) {
+                int vol_idx = vss_vol_indices[vi];
+                volume_info_t *vol = &vol_list->volumes[vol_idx];
+
+                if (strncmp(vol->name, snapshots[s].original_volume, orig_len) == 0
+                    && vol->name[orig_len] == '\0') {
+                    snprintf(vol->vss_path, sizeof(vol->vss_path), "%s",
+                             snapshots[s].snapshot_path);
+                    vol->has_vss = 1;
+                    LOG_INFO("VSS: %s → %s", vol->name, vol->vss_path);
+                    break;
+                }
+            }
+        }
+    } else {
+        LOG_INFO("VSS: no drive-letter volumes or VSS unavailable, "
+                 "using PhysicalDrive fallback");
+    }
+
+    /* ================================================================
+     * 打开读取器 (VSS 快照优先, 回退到 PhysicalDrive)
+     * ================================================================ */
+    reader_entry_t readers[MAX_VOLUMES];
     int reader_count = 0;
+    memset(readers, 0, sizeof(readers));
 
     for (int i = 0; i < vol_list->count; i++) {
         volume_info_t *vol = &vol_list->volumes[i];
@@ -495,20 +584,41 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
         }
         if (skip) continue;
 
-        readers[reader_count] = block_reader_open(vol->path);
-        if (readers[reader_count]) {
+        const char *reader_path = vol->has_vss ? vol->vss_path : vol->disk_path;
+        int use_vss = vol->has_vss;
+
+        block_reader_t *r = block_reader_open(reader_path);
+        if (!r && use_vss) {
+            /* VSS 读取失败, 回退到 PhysicalDrive */
+            LOG_WARN("VSS reader open failed, falling back to %s", vol->disk_path);
+            r = block_reader_open(vol->disk_path);
+            use_vss = 0;
+        }
+
+        if (r) {
+            reader_entry_t *entry = &readers[reader_count];
+            entry->reader           = r;
+            entry->devno            = vol->devno;
+            entry->partition_offset = vol->partition_offset;
+            entry->is_vss           = use_vss;
             reader_count++;
+            LOG_INFO("partition %s: %llu blocks via %s",
+                     vol->name, (unsigned long long)vol->block_count,
+                     use_vss ? "VSS" : "PhysicalDrive");
         }
     }
 
     if (reader_count == 0) {
-        LOG_ERROR("no disks available for migration");
+        LOG_ERROR("no partitions available for migration");
+        if (vss_ctx) vss_cleanup(vss_ctx);
         free(data_buf);
         sqlite_close(db);
         return -1;
     }
 
-    /* 增量模式: 发送 ctlIncremental */
+    /* ================================================================
+     * 增量模式: 发送 ctlIncremental
+     * ================================================================ */
     if (ctx->tail_send) {
         pool_conn_t *c = pool_acquire(&ctx->pool);
         if (c) {
@@ -518,29 +628,36 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
         }
     }
 
-    /* 主传输循环: 遍历所有磁盘的所有块 */
-    LOG_INFO("starting block transfer: %d disks", reader_count);
+    /* ================================================================
+     * 主传输循环
+     * ================================================================ */
+    LOG_INFO("starting block transfer: %d partitions", reader_count);
 
     uint64_t total_blocks = 0;
     uint64_t sent_blocks  = 0;
     uint64_t total_bytes  = 0;
 
     for (int d = 0; d < reader_count && g_running; d++) {
-        block_reader_t *reader = readers[d];
-        volume_info_t *vol = &vol_list->volumes[d];
+        reader_entry_t *entry = &readers[d];
+        block_reader_t *reader = entry->reader;
+        uint64_t part_base = entry->partition_offset;
         uint64_t n_blocks = block_reader_block_count(reader, (uint32_t)BLOCK_SIZE);
 
-        LOG_INFO("disk %d (%s): %llu blocks to transfer",
-                 vol->devno, vol->path, (unsigned long long)n_blocks);
+        LOG_INFO("partition devno=%d base=%llu: %llu blocks to transfer",
+                 entry->devno, (unsigned long long)part_base,
+                 (unsigned long long)n_blocks);
         total_blocks += n_blocks;
 
         for (uint64_t blk = 0; blk < n_blocks && g_running; blk++) {
-            uint64_t offset = blk * BLOCK_SIZE;
+            uint64_t disk_offset   = part_base + blk * BLOCK_SIZE;
+            uint64_t reader_offset = entry->is_vss
+                                     ? (blk * BLOCK_SIZE)
+                                     : disk_offset;
 
             /* 背压: 如果队列太深, 等待排空 */
             while (queue_should_backpressure(&ctx->queue) && g_running) {
                 process_ack(ctx);
-                while (flush_one(ctx) > 0) { /* 发送尽可能多 */ }
+                while (flush_one(ctx) > 0) { }
 
                 if (queue_should_backpressure(&ctx->queue)) {
 #ifdef _WIN32
@@ -552,13 +669,13 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
             }
 
             /* 发送一个块 */
-            if (send_block(ctx, reader, db,
-                          vol->devno, offset, data_buf) == 0) {
+            if (send_block(ctx, reader, db, entry->devno,
+                          disk_offset, reader_offset, data_buf) == 0) {
                 sent_blocks++;
                 total_bytes += BLOCK_SIZE;
             }
 
-            /* 发送排空: 尽量从队列发送 */
+            /* 发送排空 */
             while (flush_one(ctx) > 0) { }
 
             /* 处理 ACK */
@@ -570,14 +687,16 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
             while ((ev = timer_check(&ctx->timer, now)) != TIMER_NONE) {
                 switch (ev) {
                 case TIMER_RETRANSMIT:
-                    do_retransmit(ctx, db, readers[d], data_buf);
+                    do_retransmit(ctx, db, readers, reader_count, data_buf);
                     break;
                 case TIMER_RECONNECT:
                     do_reconnect(ctx);
                     break;
                 case TIMER_ACTION:
-                    LOG_INFO("progress: disk %d/%d block %llu/%llu sent=%llu/%llu queue=%d",
-                             d + 1, reader_count, (unsigned long long)blk,
+                    LOG_INFO("progress: partition %d/%d block %llu/%llu "
+                             "sent=%llu/%llu queue=%d",
+                             d + 1, reader_count,
+                             (unsigned long long)blk,
                              (unsigned long long)n_blocks,
                              (unsigned long long)sent_blocks,
                              (unsigned long long)total_blocks,
@@ -591,11 +710,14 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
             }
         }
 
-        LOG_INFO("disk %d complete: %llu blocks transferred",
-                 vol->devno, (unsigned long long)n_blocks);
+        LOG_INFO("partition devno=%d base=%llu complete: %llu blocks transferred",
+                 entry->devno, (unsigned long long)part_base,
+                 (unsigned long long)n_blocks);
     }
 
-    /* 排空队列 */
+    /* ================================================================
+     * 排空队列
+     * ================================================================ */
     LOG_INFO("draining send queue...");
     int drain_attempts = 0;
     while (queue_count(&ctx->queue) > 0 && drain_attempts < 300) {
@@ -609,7 +731,9 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
         drain_attempts++;
     }
 
-    /* 增量模式: 发送 ctlEndIncremental, 等待 SERVER_DONE */
+    /* ================================================================
+     * 增量模式: 发送 ctlEndIncremental, 等待 SERVER_DONE
+     * ================================================================ */
     if (ctx->tail_send) {
         pool_conn_t *c = pool_acquire(&ctx->pool);
         if (c) {
@@ -618,7 +742,6 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
             pool_release(&ctx->pool, c);
             LOG_INFO("sent ctlEndIncremental");
 
-            /* 等待 SERVER_DONE (最多 30 秒) */
             for (int w = 0; w < 300; w++) {
                 process_ack(ctx);
 #ifdef _WIN32
@@ -633,9 +756,17 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
     LOG_INFO("migration complete: %llu blocks, %llu bytes",
              (unsigned long long)sent_blocks, (unsigned long long)total_bytes);
 
+    /* ================================================================
+     * VSS 清理
+     * ================================================================ */
+    if (vss_ctx) {
+        vss_backup_complete(vss_ctx);
+        vss_cleanup(vss_ctx);
+    }
+
     /* 清理 */
     for (int i = 0; i < reader_count; i++) {
-        block_reader_close(readers[i]);
+        block_reader_close(readers[i].reader);
     }
     free(data_buf);
     sqlite_close(db);
