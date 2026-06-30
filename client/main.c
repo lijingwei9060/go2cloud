@@ -473,8 +473,10 @@ static void process_ack(migrate_ctx_t *ctx) {
                 LOG_DEBUG("ACK: devno=%d offset=%lld size=%d",
                           resp.devno, (long long)resp.offset, resp.size);
                 queue_ack(&ctx->queue, resp.devno, resp.offset);
-                /* 持久化 ACK 到 SQLite，支持崩溃恢复 */
-                if (ctx->db) {
+                /* 全量模式: 服务端 ACK 即确认, 直接标记 ack=1。
+                 * 增量模式 (TailSend): sck=0 保持不变, 由增量轮的
+                 * live disk hash 对比来确认稳定性后才标记 ack=1。 */
+                if (ctx->db && !ctx->tail_send) {
                     sqlite_block_mark_acked(ctx->db, resp.devno, resp.offset);
                 }
             } else if (resp.type == RESPONSE_SERVER_DONE) {
@@ -817,7 +819,8 @@ static int do_incremental_round(migrate_ctx_t *ctx,
         /* 计算新 hash 并对比 */
         uint64_t new_hash = hash_block(data_buf, data_len, disk_offset & 0xFFFFFFFF);
         if (new_hash == old_hash) {
-            /* 块未变化 — 跳过 */
+            /* 块未变化 — live disk 与已发送数据一致, 标记为稳定 (ack=1) */
+            sqlite_block_mark_acked(db, devno, (int64_t)disk_offset);
             continue;
         }
 
@@ -1206,6 +1209,18 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
             timer_event_t ev;
             while ((ev = timer_check(&ctx->timer, now)) != TIMER_NONE) {
                 switch (ev) {
+                case TIMER_INCREMENTAL:
+                    /* 全量传输期间也执行增量轮 — 检测已发送但未 ACK
+                     * 的块是否在 live disk 上发生了变化。TailSend 模式下
+                     * ACK 不会标记 ack=1，所以这里能捕获变化块。 */
+                    if (ctx->tail_send) {
+                        ctx->inc_round++;
+                        int req = do_incremental_round(ctx, readers, readers,
+                                                       reader_count, db, data_buf);
+                        LOG_DEBUG("inc-round #%d (in full sync): %d re-sent",
+                                  ctx->inc_round, req);
+                    }
+                    break;
                 case TIMER_RETRANSMIT:
                     do_retransmit(ctx, db, readers, reader_count, data_buf);
                     break;
@@ -1214,13 +1229,14 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
                     break;
                 case TIMER_ACTION:
                     LOG_INFO("progress: partition %d/%d block %llu/%llu "
-                             "sent=%llu/%llu queue=%d",
+                             "sent=%llu/%llu queue=%d%s",
                              d + 1, reader_count,
                              (unsigned long long)blk,
                              (unsigned long long)n_blocks,
                              (unsigned long long)sent_blocks,
                              (unsigned long long)total_blocks,
-                             queue_count(&ctx->queue));
+                             queue_count(&ctx->queue),
+                             ctx->tail_send ? " [incremental]" : "");
                     break;
                 default:
                     break;
@@ -1264,9 +1280,8 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
                  RETRANSMIT_TIMER_MS,
                  MAX_INCREMENTAL_ROUNDS, CONVERGENCE_ZERO_ROUNDS);
 
-        /* 重置增量定时器: 全量同步完成后 18s 开始第一轮增量 */
-        ctx->timer.last_fire[TIMER_INCREMENTAL] = timer_now_ms();
-        ctx->inc_round = 0;
+        /* inc_round 继续计数 (全量同步期间可能已执行若干轮) */
+        ctx->zero_change_rounds = 0;
         ctx->zero_change_rounds = 0;
 
         while (g_running && !ctx->all_done) {
