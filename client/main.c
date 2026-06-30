@@ -60,6 +60,7 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "advapi32.lib")
 #define SOCKET_ERRNO  WSAGetLastError()
 #else
 #include <sys/socket.h>
@@ -184,6 +185,66 @@ static int cmd_info(void) {
                (unsigned long long)v->block_count,
                v->name, v->disk_path);
     }
+    return 0;
+}
+
+/* ================================================================
+ * 子命令: isbios — 检测固件类型 (UEFI / Legacy)
+ * ================================================================ */
+
+static int cmd_isbios(void) {
+#ifdef _WIN32
+    /* 启用固件环境变量访问权限 */
+    HANDLE token;
+    if (OpenProcessToken(GetCurrentProcess(),
+                         TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) {
+        TOKEN_PRIVILEGES tp;
+        LUID luid;
+        if (LookupPrivilegeValueA(NULL, "SeSystemEnvironmentPrivilege", &luid)) {
+            tp.PrivilegeCount = 1;
+            tp.Privileges[0].Luid = luid;
+            tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+            AdjustTokenPrivileges(token, FALSE, &tp, 0, NULL, NULL);
+        }
+        CloseHandle(token);
+    }
+
+    /*
+     * GetFirmwareType (Windows 8+):
+     *   FirmwareTypeBios = 1 → Legacy BIOS
+     *   FirmwareTypeUefi = 2 → UEFI
+     */
+    int is_uefi = 0;
+    FIRMWARE_TYPE ft = FirmwareTypeUnknown;
+
+    /* 动态获取 GetFirmwareType (Windows 8+ kernel32.dll) */
+    HMODULE k32 = GetModuleHandleA("kernel32.dll");
+    if (k32) {
+        BOOL (WINAPI *pfnGetFirmwareType)(FIRMWARE_TYPE *) =
+            (void *)GetProcAddress(k32, "GetFirmwareType");
+        if (pfnGetFirmwareType && pfnGetFirmwareType(&ft)) {
+            is_uefi = (ft == FirmwareTypeUefi);
+        }
+    }
+
+    if (!is_uefi && ft == FirmwareTypeUnknown) {
+        /*
+         * 回退: 探测 UEFI 变量命名空间。
+         * 非 UEFI 系统上 GetFirmwareEnvironmentVariableA 返回失败
+         * (ERROR_INVALID_FUNCTION)。
+         */
+        if (GetFirmwareEnvironmentVariableA(
+                "{00000000-0000-0000-0000-000000000000}",
+                "{00000000-0000-0000-0000-000000000000}",
+                NULL, 0) > 0) {
+            is_uefi = 1;
+        }
+    }
+
+    printf("%s\n", is_uefi ? "UEFI" : "Legacy");
+#else
+    printf("Legacy\n");
+#endif
     return 0;
 }
 
@@ -806,6 +867,7 @@ int main(int argc, char *argv[]) {
         printf("  %s info                       Show disk information\n", argv[0]);
         printf("  %s hash <file>                Compute block hash\n", argv[0]);
         printf("  %s check <disk>               Check disk accessibility\n", argv[0]);
+        printf("  %s isbios                     Detect firmware type (UEFI/Legacy)\n", argv[0]);
         printf("  %s begin_session              Mark migration session start\n", argv[0]);
         printf("  %s --help                     Show this help\n", argv[0]);
         return 0;
@@ -818,6 +880,7 @@ int main(int argc, char *argv[]) {
         printf("  %s info\n", argv[0]);
         printf("  %s hash <file>\n", argv[0]);
         printf("  %s check <disk>\n", argv[0]);
+        printf("  %s isbios\n", argv[0]);
         printf("  %s begin_session\n", argv[0]);
         printf("\nConfig file defaults to user.json\n");
         return 0;
@@ -838,6 +901,9 @@ int main(int argc, char *argv[]) {
     }
     if (strcmp(argv[1], "begin_session") == 0) {
         return cmd_begin_session();
+    }
+    if (strcmp(argv[1], "isbios") == 0) {
+        return cmd_isbios();
     }
 
     /* ————— 迁移模式 ————— */
