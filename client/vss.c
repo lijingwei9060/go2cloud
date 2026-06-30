@@ -415,9 +415,17 @@ int vss_delete_snapshot(const char *snapshot_id_str) {
         return -1;
     }
 
-    /* 解析 GUID 字符串 */
+    /* 解析 GUID 字符串 (auto-add braces if missing) */
+    char guid_buf[64];
+    if (snapshot_id_str[0] == '{') {
+        strncpy(guid_buf, snapshot_id_str, sizeof(guid_buf) - 1);
+        guid_buf[sizeof(guid_buf) - 1] = '\0';
+    } else {
+        snprintf(guid_buf, sizeof(guid_buf), "{%s}", snapshot_id_str);
+    }
+
     WCHAR wide_guid[64];
-    MultiByteToWideChar(CP_ACP, 0, snapshot_id_str, -1, wide_guid, 64);
+    MultiByteToWideChar(CP_ACP, 0, guid_buf, -1, wide_guid, 64);
 
     VSS_ID snapshot_id;
     HRESULT hr = CLSIDFromString(wide_guid, (LPCLSID)&snapshot_id);
