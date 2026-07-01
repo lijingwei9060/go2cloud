@@ -295,6 +295,113 @@ int sqlite_update_last_sent(sqlite_db_t *db, int32_t devno, int64_t offset,
     return (rc == SQLITE_DONE) ? 0 : -1;
 }
 
+int sqlite_get_block_info(sqlite_db_t *db, int32_t devno, int64_t offset,
+                          block_info_t *info) {
+    sqlite3_stmt *stmt = NULL;
+    const char *sql = "SELECT devno, offset, size, hash, ack, last_sent, "
+                      "IFNULL(remote_id, '') FROM T_BLOCK "
+                      "WHERE devno=? AND offset=?";
+    int rc = sqlite3_prepare_v2(db->handle, sql, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) return -2;
+
+    sqlite3_bind_int(stmt, 1, devno);
+    sqlite3_bind_int64(stmt, 2, offset);
+
+    rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+        memset(info, 0, sizeof(*info));
+        info->devno     = sqlite3_column_int(stmt, 0);
+        info->offset    = sqlite3_column_int64(stmt, 1);
+        info->size      = sqlite3_column_int(stmt, 2);
+        info->hash      = (uint64_t)sqlite3_column_int64(stmt, 3);
+        info->ack       = sqlite3_column_int(stmt, 4);
+        info->last_sent = sqlite3_column_int64(stmt, 5);
+        const unsigned char *rid = sqlite3_column_text(stmt, 6);
+        if (rid) {
+            strncpy(info->remote_id, (const char *)rid,
+                    sizeof(info->remote_id) - 1);
+        }
+        sqlite3_finalize(stmt);
+        return 0;
+    }
+
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_DONE) ? -1 : -2;
+}
+
+int sqlite_list_blocks(sqlite_db_t *db, int32_t devno,
+                       block_info_t *infos, int max_count) {
+    sqlite3_stmt *stmt = NULL;
+    const char *sql;
+    if (devno >= 0) {
+        sql = "SELECT devno, offset, size, hash, ack, last_sent, "
+              "IFNULL(remote_id, '') FROM T_BLOCK "
+              "WHERE devno=? ORDER BY offset LIMIT ?";
+    } else {
+        sql = "SELECT devno, offset, size, hash, ack, last_sent, "
+              "IFNULL(remote_id, '') FROM T_BLOCK "
+              "ORDER BY devno, offset LIMIT ?";
+    }
+    int rc = sqlite3_prepare_v2(db->handle, sql, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) return -1;
+
+    int idx = 1;
+    if (devno >= 0) {
+        sqlite3_bind_int(stmt, idx++, devno);
+    }
+    sqlite3_bind_int(stmt, idx++, max_count);
+
+    int count = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW && count < max_count) {
+        block_info_t *info = &infos[count];
+        memset(info, 0, sizeof(*info));
+        info->devno     = sqlite3_column_int(stmt, 0);
+        info->offset    = sqlite3_column_int64(stmt, 1);
+        info->size      = sqlite3_column_int(stmt, 2);
+        info->hash      = (uint64_t)sqlite3_column_int64(stmt, 3);
+        info->ack       = sqlite3_column_int(stmt, 4);
+        info->last_sent = sqlite3_column_int64(stmt, 5);
+        const unsigned char *rid = sqlite3_column_text(stmt, 6);
+        if (rid) {
+            strncpy(info->remote_id, (const char *)rid,
+                    sizeof(info->remote_id) - 1);
+        }
+        count++;
+    }
+
+    sqlite3_finalize(stmt);
+    return count;
+}
+
+int sqlite_count_blocks(sqlite_db_t *db, int32_t devno, int ack) {
+    sqlite3_stmt *stmt = NULL;
+    char sql[256];
+    int idx = 1;
+
+    strncpy(sql, "SELECT COUNT(*) FROM T_BLOCK WHERE 1=1", sizeof(sql) - 1);
+    sql[sizeof(sql) - 1] = '\0';
+
+    if (devno >= 0) {
+        strncat(sql, " AND devno=?", sizeof(sql) - strlen(sql) - 1);
+    }
+    if (ack >= 0) {
+        strncat(sql, " AND ack=?", sizeof(sql) - strlen(sql) - 1);
+    }
+
+    int rc = sqlite3_prepare_v2(db->handle, sql, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) return -1;
+
+    if (devno >= 0) sqlite3_bind_int(stmt, idx++, devno);
+    if (ack >= 0) sqlite3_bind_int(stmt, idx++, ack);
+
+    int count = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        count = sqlite3_column_int(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    return count;
+}
+
 int sqlite_count_unacked(sqlite_db_t *db, const char *remote_id) {
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db->handle, SQL_COUNT_UNACKED, -1, &stmt, NULL);

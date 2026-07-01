@@ -36,6 +36,7 @@ client.exe vss_query              # 查询所有现有快照
 client.exe vss_delete <guid>      # 删除指定快照
 client.exe vss_delete --all       # 删除所有快照
 client.exe dryrun [config.json]   # 本地模拟全量+增量迁移，无网络 I/O
+client.exe blockinfo [db] [devno] [offset]  # 查询块跟踪数据库
 client.exe --help                 # 显示帮助
 ```
 
@@ -185,8 +186,10 @@ client.exe end_session          # 清理 tracker.db → DELETE FROM T_BLOCK
 
 ```
 client.exe check \\.\PhysicalDrive0          # 检查磁盘可读性
-client.exe hash C:\data\block.bin            # 计算块级哈希
+client.exe hash C:\data\block.bin            # 计算块级哈希（Windows）
 ```
+
+> Linux 端使用 `tools/hash_block.c` 工具计算相同算法的哈希，详见 3.11 节。
 
 ### 3.9 dryrun — 本地模拟迁移（无服务端）
 
@@ -258,6 +261,104 @@ Disk   Size(GB) TotalBlocks      Name
 **权限**：需要管理员权限（与真实迁移一致，PhysicalDrive 访问要求）。
 
 **退出码**：0 成功，1 失败（无磁盘可访问）。
+
+### 3.10 blockinfo — 查询块跟踪数据库
+
+```
+client.exe blockinfo [db_path]                      整体摘要（按磁盘分组统计）
+client.exe blockinfo [db_path] <devno>              列出指定磁盘所有块
+client.exe blockinfo [db_path] <devno> <offset>     查看单个块详情
+```
+
+- `db_path` 默认 `tracker.db`，仅当第一个参数含 `.` 时识别为数据库路径
+- `devno`：磁盘编号（与 `info` 子命令输出的 Disk 列对应）
+- `offset`：块在磁盘上的字节偏移量
+
+**示例 1 — 整体摘要**：
+
+```
+$ client.exe blockinfo
+Database: tracker.db
+  Total blocks:  204800
+  Confirmed:     204800
+  Pending:       0
+  Acked bytes:   214748364800  (200.00 GB)
+
+  Per-disk breakdown:
+  disk   total    acked    pending
+  ------ -------- -------- --------
+  0      204800   204800   0
+```
+
+**示例 2 — 按磁盘列出**：
+
+```
+$ client.exe blockinfo tracker.db 0
+Disk 0: 204800 blocks total, 204800 confirmed, 0 pending
+devno    offset           size       hash               ack
+-------- ---------------- ---------- ------------------ ---
+0        0                1048576    0x3a7b2c1d8e4f5a6b 1
+0        1048576          1048576    0x8f1e2d3c4b5a6c7d 1
+0        2097152          1048576    0x1a2b3c4d5e6f7a8b 1
+...
+```
+
+**示例 3 — 单块详情**：
+
+```
+$ client.exe blockinfo tracker.db 0 1048576
+Block Info (tracker.db):
+  devno      = 0
+  offset     = 1048576  (block #1)
+  size       = 1048576  (1.00 MB)
+  hash       = 0x3a7b2c1d8e4f5a6b
+  ack        = 1  (confirmed)
+  last_sent  = 1751413200
+  remote_id  = 192.168.1.100:3389
+```
+
+**跨进程安全**：blockinfo 以只读方式打开数据库，SQLite WAL 模式允许多个读进程与一个写进程（迁移进程）并发。可在迁移运行时安全使用。
+
+### 3.11 hash_block — Linux 块哈希工具
+
+`tools/hash_block.c` 是独立的 Linux 命令行工具，使用与 `client.exe` 完全相同的自定义哈希算法。用于在 Linux 端校验源端写入的数据块哈希。
+
+**编译**：
+
+```bash
+gcc -O2 -o hash_block tools/hash_block.c
+```
+
+**用法**：
+
+```bash
+# 计算整个文件 (seed=0, 匹配全量同步哈希)
+./hash_block /path/to/disk0.img
+
+# 指定偏移和大小 (匹配单个块)
+./hash_block /path/to/disk0.img 1048576 1048576
+
+# 从管道读取 (dd 读取原始磁盘的某个块)
+dd if=/dev/sdb bs=1M skip=1 count=1 2>/dev/null | ./hash_block -
+
+# 指定 seed (增量同步: seed = offset & 0xFFFFFFFF)
+./hash_block /path/to/disk0.img 1048576 1048576 1048576
+```
+
+**输出格式**：
+
+```
+0x3a7b2c1d8e4f5a6b  (offset=1048576, size=1048576, seed=0x00000000)
+```
+
+**seed 说明**：
+
+| 同步模式 | seed 值 | client.exe 中对应位置 |
+|---------|---------|---------------------|
+| 全量同步 | `0` | `send_block()` line 600 |
+| 增量同步 | `offset & 0xFFFFFFFF` | `do_incremental()` line 701/1003 |
+
+要匹配数据库中某个块的 hash，需根据块的来源（全量或增量）使用对应的 seed 值。通常情况下全量同步使用 seed=0，产生的 hash 存储在 `T_BLOCK` 表中。
 
 ---
 
@@ -487,6 +588,8 @@ CREATE INDEX IF NOT EXISTS idx_ack ON T_BLOCK(ack);
 | 重置已确认 | `sqlite_reset_acked(db, remote_id)` | 增量轮开始：将所有 `ack=1` 重置为 `ack=0` |
 | 查询已确认字节 | `sqlite_total_acked_bytes(db)` | `sentbytes` 子命令：跨进程进度查询 |
 | 清空表 | `sqlite_clear_all_blocks(db)` | `end_session` / 迁移完成后清理 |
+| 块信息查询 | `sqlite_get_block_info()` / `sqlite_list_blocks()` | `blockinfo` 子命令：逐块检查状态 |
+| 块数统计 | `sqlite_count_blocks(devno, ack)` | `blockinfo` 子命令：按磁盘/确认状态统计 |
 
 ### 6.3 ACK 语义与生命周期
 
@@ -532,9 +635,11 @@ Go 控制端（go2tencentcloud）
 │
 ├─ client.exe vss_delete <guid> → 删除迁移快照
 │
-└─ client.exe vss_delete --all  → 清理所有快照
+├─ client.exe vss_delete --all  → 清理所有快照
 │
-└─ client.exe dryrun [config]   → 本地模拟迁移（验证流水线 / 性能基准）
+├─ client.exe dryrun [config]   → 本地模拟迁移（验证流水线 / 性能基准）
+│
+└─ client.exe blockinfo [db] ...→ 查询块跟踪数据库（调试 / 校验）
 ```
 
 ---

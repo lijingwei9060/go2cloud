@@ -231,6 +231,149 @@ static int cmd_sentbytes(const char *db_path) {
 }
 
 /* ================================================================
+ * 子命令: blockinfo — 查询块跟踪数据库
+ *
+ *   client.exe blockinfo <db_path>                    整体摘要
+ *   client.exe blockinfo <db_path> <devno>            按磁盘列出
+ *   client.exe blockinfo <db_path> <devno> <offset>   单个块详情
+ * ================================================================ */
+
+static void print_block_detail(const block_info_t *b) {
+    char hash_str[32];
+    snprintf(hash_str, sizeof(hash_str), "0x%016llx",
+             (unsigned long long)b->hash);
+
+    printf("  devno      = %d\n",   (int)b->devno);
+    printf("  offset     = %lld",   (long long)b->offset);
+    /* 当偏移量为 BLOCK_SIZE 的整数倍时显示块索引 */
+    if (b->offset % BLOCK_SIZE == 0) {
+        printf("  (block #%lld)", (long long)(b->offset / BLOCK_SIZE));
+    }
+    printf("\n");
+    printf("  size       = %d",     (int)b->size);
+    if (b->size > 0) {
+        double mb = (double)b->size / (1024.0 * 1024.0);
+        printf("  (%.2f MB)", mb);
+    }
+    printf("\n");
+    printf("  hash       = %s\n",   hash_str);
+    printf("  ack        = %d",     b->ack);
+    printf("  (%s)\n",              b->ack ? "confirmed" : "pending");
+    printf("  last_sent  = %lld\n", (long long)b->last_sent);
+    if (b->remote_id[0]) {
+        printf("  remote_id  = %s\n", b->remote_id);
+    }
+}
+
+static int cmd_blockinfo(int argc, char *argv[]) {
+    const char *db_path = "tracker.db";
+    int filter_devno = -1;
+    int64_t filter_offset = -1;
+    int has_offset = 0;
+
+    /* 解析参数 */
+    int arg_idx = 2;
+    if (argc > 2 && argv[2][0] != '-' && strchr(argv[2], '.') != NULL) {
+        db_path = argv[2];
+        arg_idx++;
+    }
+    if (argc > arg_idx) {
+        filter_devno = atoi(argv[arg_idx++]);
+    }
+    if (argc > arg_idx) {
+        filter_offset = (int64_t)atoll(argv[arg_idx++]);
+        has_offset = 1;
+    }
+
+    sqlite_db_t *db = sqlite_open(db_path);
+    if (!db) {
+        printf("ERROR: cannot open database: %s\n", db_path);
+        return 1;
+    }
+
+    if (has_offset) {
+        /* ——— 单个块详情 ——— */
+        block_info_t info;
+        int rc = sqlite_get_block_info(db, (int32_t)filter_devno,
+                                       filter_offset, &info);
+        if (rc == 0) {
+            printf("Block Info (%s):\n", db_path);
+            print_block_detail(&info);
+        } else if (rc == -1) {
+            printf("Block not found: devno=%d offset=%lld\n",
+                   filter_devno, (long long)filter_offset);
+        } else {
+            printf("Database error\n");
+        }
+    } else if (filter_devno >= 0) {
+        /* ——— 按磁盘列出 ——— */
+        int total = sqlite_count_blocks(db, filter_devno, -1);
+        int acked = sqlite_count_blocks(db, filter_devno, 1);
+        int pending = sqlite_count_blocks(db, filter_devno, 0);
+        printf("Disk %d: %d blocks total, %d confirmed, %d pending\n",
+               filter_devno, total, acked, pending);
+
+        if (total > 0) {
+            printf("%-8s %-16s %-10s %-18s %-3s\n",
+                   "devno", "offset", "size", "hash", "ack");
+            printf("-------- ---------------- ---------- ------------------ ---\n");
+
+            block_info_t *list = calloc((size_t)total, sizeof(block_info_t));
+            if (list) {
+                int n = sqlite_list_blocks(db, filter_devno, list, total);
+                for (int i = 0; i < n; i++) {
+                    char hash_str[32];
+                    snprintf(hash_str, sizeof(hash_str), "0x%016llx",
+                             (unsigned long long)list[i].hash);
+                    printf("%-8d %-16lld %-10d %-18s %-3d\n",
+                           (int)list[i].devno,
+                           (long long)list[i].offset,
+                           (int)list[i].size,
+                           hash_str,
+                           list[i].ack);
+                }
+                free(list);
+            }
+        }
+    } else {
+        /* ——— 整体摘要 ——— */
+        int total = sqlite_count_blocks(db, -1, -1);
+        int acked = sqlite_count_blocks(db, -1, 1);
+        int pending = sqlite_count_blocks(db, -1, 0);
+        int64_t acked_bytes = sqlite_total_acked_bytes(db);
+
+        printf("Database: %s\n", db_path);
+        printf("  Total blocks:  %d\n", total);
+        printf("  Confirmed:     %d\n", acked);
+        printf("  Pending:       %d\n", pending);
+        printf("  Acked bytes:   %lld", (long long)acked_bytes);
+        if (acked_bytes > 0) {
+            double gb = (double)acked_bytes / (1024.0 * 1024.0 * 1024.0);
+            printf("  (%.2f GB)", gb);
+        }
+        printf("\n");
+
+        /* 按磁盘分别统计 */
+        if (total > 0) {
+            printf("\n  Per-disk breakdown:\n");
+            printf("  %-6s %-8s %-8s %-8s\n",
+                   "disk", "total", "acked", "pending");
+            printf("  ------ -------- -------- --------\n");
+            for (int d = 0; d < 16; d++) {
+                int dt = sqlite_count_blocks(db, d, -1);
+                if (dt == 0) continue;
+                int da = sqlite_count_blocks(db, d, 1);
+                int dp = sqlite_count_blocks(db, d, 0);
+                printf("  %-6d %-8d %-8d %-8d\n", d, dt, da, dp);
+            }
+        }
+    }
+
+    sqlite_close(db);
+    return 0;
+}
+
+/* ================================================================
  * 子命令: test_vss — 验证 VSS 快照功能
  * ================================================================ */
 
@@ -1679,6 +1822,7 @@ int main(int argc, char *argv[]) {
         printf("  %s vss_query                  List all existing snapshots\n", argv[0]);
         printf("  %s vss_delete <guid>          Delete specific snapshot\n", argv[0]);
         printf("  %s vss_delete --all           Delete all snapshots\n", argv[0]);
+        printf("  %s blockinfo [db] [devno] [offset]  Query block tracking database\n", argv[0]);
         printf("  %s dryrun [config.json]       Simulate full migration locally\n", argv[0]);
         printf("  %s --help                     Show this help\n", argv[0]);
         return 0;
@@ -1700,6 +1844,7 @@ int main(int argc, char *argv[]) {
         printf("  %s vss_delete <guid>\n", argv[0]);
         printf("  %s vss_delete --all\n", argv[0]);
         printf("  %s dryrun [config.json]\n", argv[0]);
+        printf("  %s blockinfo [db] [devno] [offset]\n", argv[0]);
         printf("\nConfig file defaults to user.json\n");
         return 0;
     }
@@ -1737,6 +1882,9 @@ int main(int argc, char *argv[]) {
     }
     if (strcmp(argv[1], "vss_delete") == 0) {
         return cmd_vss_delete(argc, argv);
+    }
+    if (strcmp(argv[1], "blockinfo") == 0) {
+        return cmd_blockinfo(argc, argv);
     }
     if (strcmp(argv[1], "dryrun") == 0) {
         return cmd_dryrun(argc, argv);

@@ -128,4 +128,39 @@ int sqlite_clear_all_blocks(sqlite_db_t *db);
  */
 void sqlite_set_remote_id(sqlite_db_t *db, const char *remote_id);
 
+/*
+ * 块信息结构体 — 用于查询 T_BLOCK 单行所有字段。
+ */
+typedef struct {
+    int32_t  devno;
+    int64_t  offset;
+    int32_t  size;
+    uint64_t hash;
+    int      ack;
+    int64_t  last_sent;
+    char     remote_id[256];
+} block_info_t;
+
+/*
+ * 查询单个块的所有信息。
+ * 返回: 0=找到, -1=未找到, -2=数据库错误
+ */
+int sqlite_get_block_info(sqlite_db_t *db, int32_t devno, int64_t offset,
+                          block_info_t *info);
+
+/*
+ * 列出所有块 (可按 devno 过滤)。
+ * devno < 0 表示不过滤。
+ * infos: 输出数组, max_count: 最大条目数
+ * 返回条目数, 错误返回 -1。
+ */
+int sqlite_list_blocks(sqlite_db_t *db, int32_t devno,
+                       block_info_t *infos, int max_count);
+
+/*
+ * 统计块数 (可按 devno 和 ack 过滤)。
+ * devno < 0 表示不过滤, ack < 0 表示不过滤。
+ */
+int sqlite_count_blocks(sqlite_db_t *db, int32_t devno, int ack);
+
 #endif /* CLIENT_SQLITE_H */
