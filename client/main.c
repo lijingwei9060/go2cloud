@@ -233,9 +233,10 @@ static int cmd_sentbytes(const char *db_path) {
 /* ================================================================
  * 子命令: blockinfo — 查询块跟踪数据库
  *
- *   client.exe blockinfo <db_path>                    整体摘要
- *   client.exe blockinfo <db_path> <devno>            按磁盘列出
- *   client.exe blockinfo <db_path> <devno> <offset>   单个块详情
+ *   client.exe blockinfo [flags] <db_path>                    整体摘要
+ *   client.exe blockinfo [flags] <db_path> <devno>            按磁盘列出
+ *   client.exe blockinfo <db_path> <devno> <offset>           单个块详情
+ *   flags: --pending (ack=0), --acked (ack=1)
  * ================================================================ */
 
 static void print_block_detail(const block_info_t *b) {
@@ -270,11 +271,22 @@ static int cmd_blockinfo(int argc, char *argv[]) {
     int filter_devno = -1;
     int64_t filter_offset = -1;
     int has_offset = 0;
+    int filter_ack   = -1;  /* -1=all, 0=pending, 1=acked */
 
     /* 解析参数 */
     int arg_idx = 2;
-    if (argc > 2 && argv[2][0] != '-' && strchr(argv[2], '.') != NULL) {
-        db_path = argv[2];
+    while (argc > arg_idx && argv[arg_idx][0] == '-') {
+        if (strcmp(argv[arg_idx], "--pending") == 0) {
+            filter_ack = 0;
+        } else if (strcmp(argv[arg_idx], "--acked") == 0) {
+            filter_ack = 1;
+        } else if (strcmp(argv[arg_idx], "--all") == 0) {
+            filter_ack = -1;
+        }
+        arg_idx++;
+    }
+    if (argc > arg_idx && strchr(argv[arg_idx], '.') != NULL) {
+        db_path = argv[arg_idx];
         arg_idx++;
     }
     if (argc > arg_idx) {
@@ -310,18 +322,25 @@ static int cmd_blockinfo(int argc, char *argv[]) {
         int total = sqlite_count_blocks(db, filter_devno, -1);
         int acked = sqlite_count_blocks(db, filter_devno, 1);
         int pending = sqlite_count_blocks(db, filter_devno, 0);
-        printf("Disk %d: %d blocks total, %d confirmed, %d pending\n",
-               filter_devno, total, acked, pending);
+        const char *label = filter_ack == 0 ? "pending" :
+                           filter_ack == 1 ? "confirmed" : "total";
+        printf("Disk %d: %d blocks %s (%d confirmed, %d pending)\n",
+               filter_devno,
+               filter_ack == 0 ? pending : filter_ack == 1 ? acked : total,
+               label, acked, pending);
 
         if (total > 0) {
             printf("%-8s %-16s %-10s %-18s %-3s\n",
                    "devno", "offset", "size", "hash", "ack");
             printf("-------- ---------------- ---------- ------------------ ---\n");
 
+            int cap = filter_ack == 0 ? pending : filter_ack == 1 ? acked : total;
+            if (cap > 0) {
             block_info_t *list = calloc((size_t)total, sizeof(block_info_t));
             if (list) {
                 int n = sqlite_list_blocks(db, filter_devno, list, total);
                 for (int i = 0; i < n; i++) {
+                    if (filter_ack >= 0 && list[i].ack != filter_ack) continue;
                     char hash_str[32];
                     snprintf(hash_str, sizeof(hash_str), "0x%016llx",
                              (unsigned long long)list[i].hash);
@@ -333,6 +352,7 @@ static int cmd_blockinfo(int argc, char *argv[]) {
                            list[i].ack);
                 }
                 free(list);
+            }
             }
         }
     } else {
@@ -1844,7 +1864,9 @@ int main(int argc, char *argv[]) {
         printf("  %s vss_query                  List all existing snapshots\n", argv[0]);
         printf("  %s vss_delete <guid>          Delete specific snapshot\n", argv[0]);
         printf("  %s vss_delete --all           Delete all snapshots\n", argv[0]);
-        printf("  %s blockinfo [db] [devno] [offset]  Query block tracking database\n", argv[0]);
+        printf("  %s blockinfo [flags] [db] [devno] [offset]  Query block tracking DB\n", argv[0]);
+        printf("        --pending           Show only pending (ack=0) blocks\n");
+        printf("        --acked             Show only confirmed (ack=1) blocks\n");
         printf("  %s dryrun [config.json]       Simulate full migration locally\n", argv[0]);
         printf("  %s --help                     Show this help\n", argv[0]);
         return 0;
@@ -1866,7 +1888,7 @@ int main(int argc, char *argv[]) {
         printf("  %s vss_delete <guid>\n", argv[0]);
         printf("  %s vss_delete --all\n", argv[0]);
         printf("  %s dryrun [config.json]\n", argv[0]);
-        printf("  %s blockinfo [db] [devno] [offset]\n", argv[0]);
+        printf("  %s blockinfo [flags] [db] [devno] [offset]\n", argv[0]);
         printf("\nConfig file defaults to user.json\n");
         return 0;
     }
