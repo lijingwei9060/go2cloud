@@ -19,7 +19,7 @@
  *   }
  *
  * Build (Linux):
- *   gcc -O2 -Wall -o receiver server/*.c -lzstd -lpthread
+ *   gcc -O2 -Wall -o receiver server\/\*.c -Iinclude -lzstd -lpthread
  *
  * Build (Windows — MSVC):
  *   cl /O2 /utf-8 /Fe:receiver.exe server\*.c /Iinclude ^
@@ -122,8 +122,11 @@ static char *read_file_all(const char *path) {
     fseek(f, 0, SEEK_SET);
     char *buf = malloc(size + 1);
     if (buf) {
-        fread(buf, 1, size, f);
-        buf[size] = '\0';
+        if (fread(buf, 1, size, f) != (size_t)size) {
+            free(buf);
+            buf = NULL;
+        }
+        if (buf) buf[size] = '\0';
     }
     fclose(f);
     return buf;
@@ -433,7 +436,7 @@ int main(int argc, char *argv[]) {
         if (listen_section) {
             char addr[64];
             if (json_read_str(listen_section, "Address", addr, sizeof(addr))) {
-                strncpy(srv_cfg.address, addr, sizeof(srv_cfg.address) - 1);
+                snprintf(srv_cfg.address, sizeof(srv_cfg.address), "%s", addr);
             }
             srv_cfg.port = (uint16_t)json_read_int(listen_section, "Port", 3389);
             srv_cfg.max_connections = json_read_int(listen_section, "MaxConnections", 7);

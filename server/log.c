@@ -65,7 +65,7 @@ void log_write(int level, const char *file, int line,
 #else
     localtime_r(&now, &tm_buf);
 #endif
-    char time_str[32];
+    char time_str[64];
     snprintf(time_str, sizeof(time_str),
              "%04d/%02d/%02d %02d:%02d:%02d",
              tm_buf.tm_year + 1900, tm_buf.tm_mon + 1, tm_buf.tm_mday,

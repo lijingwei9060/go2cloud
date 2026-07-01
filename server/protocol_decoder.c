@@ -37,7 +37,6 @@ static int msgpack_read_int(const uint8_t *buf, size_t buf_len,
                             int64_t *out_val) {
     if (buf_len < 1) return 0;
     uint8_t tag = buf[0];
-    int used = 1;
 
     if (tag <= 0x7f) {
         /* fixint 正数: 0~127 */
@@ -276,7 +275,6 @@ int protocol_decode(session_t *session, const uint8_t *buf, size_t len,
         }
     }
 
-frame_done:
     /* 将已处理的数据移出缓冲区 (处理 TCP 粘包) */
     size_t remaining = session->recv_len - total_needed;
     if (remaining > 0) {

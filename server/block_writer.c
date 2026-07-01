@@ -27,7 +27,7 @@
 #else
 #include <fcntl.h>
 #include <unistd.h>
-#define lseek64  lseek64
+#define lseek64  lseek
 #endif
 
 /* Target disk descriptor */
