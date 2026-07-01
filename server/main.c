@@ -263,6 +263,8 @@ static void handle_session(session_t *s) {
                 case DECODE_DATA_BLOCK:
                     if (block_writer_write(msg->devno, msg->offset,
                                            msg->data, msg->data_len) == 0) {
+                        s->blocks_received++;
+                        s->bytes_received += msg->data_len;
                         ack_send_block(s->fd, msg->devno, msg->data_len, msg->offset);
 
                         /* BINLOG monitoring: alert client when pending write buffer

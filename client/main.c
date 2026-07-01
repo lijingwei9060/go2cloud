@@ -1378,6 +1378,9 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
             }
 
             uint64_t disk_size = block_reader_size(disk);
+            /* 对齐到 BLOCK_SIZE，避免 IOCTL_DISK_GET_LENGTH_INFO
+             * 返回非整数 MB 导致 receiver 端文件多出尾部碎片 */
+            uint64_t aligned_end = (disk_size / BLOCK_SIZE) * BLOCK_SIZE;
             int32_t dno = (int32_t)devno;
 
             /* 前 1MB — 主 GPT 元数据 */
@@ -1390,9 +1393,9 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
             LOG_INFO("GPT: primary header sent (devno=%d offset=0)", devno);
 
             /* 末尾 2MB — 备份 GPT + 对齐间隙 */
-            if (disk_size >= 2 * BLOCK_SIZE) {
+            if (aligned_end >= 2 * BLOCK_SIZE) {
                 for (int t = 2; t >= 1 && g_running; t--) {
-                    uint64_t off = disk_size - (uint64_t)t * BLOCK_SIZE;
+                    uint64_t off = aligned_end - (uint64_t)t * BLOCK_SIZE;
                     if (send_block(ctx, disk, db, dno,
                                   off, off, data_buf) == 0) {
                         sent_blocks++;
