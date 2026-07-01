@@ -402,6 +402,32 @@ int sqlite_count_blocks(sqlite_db_t *db, int32_t devno, int ack) {
     return count;
 }
 
+int sqlite_reset_acked(sqlite_db_t *db, const char *remote_id) {
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db->handle, SQL_RESET_ACKED, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        LOG_ERROR("sqlite_reset_acked: prepare failed: %s",
+                  sqlite3_errmsg(db->handle));
+        return -1;
+    }
+
+    sqlite3_bind_text(stmt, 1, remote_id ? remote_id : db->remote_id,
+                      -1, SQLITE_STATIC);
+
+    rc = sqlite3_step(stmt);
+    int changed = sqlite3_changes(db->handle);
+    sqlite3_finalize(stmt);
+
+    if (rc != SQLITE_DONE) {
+        LOG_ERROR("sqlite_reset_acked: step failed: %s",
+                  sqlite3_errmsg(db->handle));
+        return -1;
+    }
+
+    LOG_INFO("sqlite: reset %d blocks (ack=1 → ack=0)", changed);
+    return changed;
+}
+
 int sqlite_count_unacked(sqlite_db_t *db, const char *remote_id) {
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db->handle, SQL_COUNT_UNACKED, -1, &stmt, NULL);

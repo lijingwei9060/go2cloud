@@ -928,17 +928,17 @@ static int do_incremental_round(migrate_ctx_t *ctx,
                                   reader_entry_t *vss_readers,
                                   int reader_count,
                                   sqlite_db_t *db, uint8_t *data_buf) {
-    int32_t  devnos[512];
-    int64_t  offsets[512];
-    uint64_t hashes[512];
-    int64_t  last_sents[512];
+    int32_t  devnos[4096];
+    int64_t  offsets[4096];
+    uint64_t hashes[4096];
+    int64_t  last_sents[4096];
     char remote_id[256];
     snprintf(remote_id, sizeof(remote_id), "%s:%d",
              ctx->server_ip, (int)ctx->server_port);
 
     int count = sqlite_get_unacked_with_hash(db, devnos, offsets,
                                               hashes, last_sents,
-                                              512, remote_id);
+                                              4096, remote_id);
     if (count <= 0) {
         LOG_DEBUG("incremental round: no unacked blocks");
         return 0;
@@ -1134,6 +1134,7 @@ static int should_finish(migrate_ctx_t *ctx, sqlite_db_t *db, int requeued) {
     snprintf(remote_id, sizeof(remote_id), "%s:%d",
              ctx->server_ip, (int)ctx->server_port);
     int unacked = sqlite_count_unacked(db, remote_id);
+    int total   = sqlite_count_blocks(db, -1, -1);
 
     /* 条件 1: 完美收敛 — 零未确认块 */
     if (unacked == 0) {
@@ -1141,14 +1142,24 @@ static int should_finish(migrate_ctx_t *ctx, sqlite_db_t *db, int requeued) {
         return 1;
     }
 
-    /* 条件 2: 稳定收敛 — 连续 N 轮无新变化块 */
+    /* 条件 2: 稳定收敛 — 连续 N 轮无新变化块, 且大部分块已验证。
+     * 仅当 unacked < 5% 总块数时才允许稳定收敛, 避免在 reset_acked
+     * 后还有大量未验证块时过早退出。 */
     if (requeued == 0) {
         ctx->zero_change_rounds++;
         if (ctx->zero_change_rounds >= CONVERGENCE_ZERO_ROUNDS) {
-            LOG_INFO("incremental sync: converged after %d rounds with 0 changes "
-                     "(unacked=%d, will recover via NTFS journal replay on target)",
-                     ctx->zero_change_rounds, unacked);
-            return 1;
+            int threshold = total / 20;  /* 5% */
+            if (threshold < 512) threshold = 512;  /* 至少一个批次 */
+            if (unacked <= threshold) {
+                LOG_INFO("incremental sync: converged after %d rounds with 0 "
+                         "changes (unacked=%d/%d, will recover via NTFS journal "
+                         "replay on target)",
+                         ctx->zero_change_rounds, unacked, total);
+                return 1;
+            }
+            LOG_DEBUG("incremental: %d stable rounds but unacked=%d/%d "
+                      "(>5%%), continuing verification",
+                      ctx->zero_change_rounds, unacked, total);
         }
     } else {
         ctx->zero_change_rounds = 0;  /* 有新变化 → 重置计数器 */
@@ -1586,7 +1597,18 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
 
         /* inc_round 继续计数 (全量同步期间可能已执行若干轮) */
         ctx->zero_change_rounds = 0;
-        ctx->zero_change_rounds = 0;
+
+        /* 如果所有块都是 ack=1 (上次会话遗留或全量同步期间全部验证稳定),
+         * 重置为 ack=0, 触发从 live disk 重读验证。*/
+        {
+            int unacked = sqlite_count_unacked(db, remote_id);
+            int acked   = sqlite_count_blocks(db, -1, 1);
+            if (unacked == 0 && acked > 0) {
+                int reset = sqlite_reset_acked(db, remote_id);
+                LOG_INFO("incremental: reset %d blocks inherited from prior session, "
+                         "re-verifying from live disk", reset);
+            }
+        }
 
         while (g_running && !ctx->all_done) {
             /* 发送 + 接收 + 定时器处理 */

@@ -163,4 +163,13 @@ int sqlite_list_blocks(sqlite_db_t *db, int32_t devno,
  */
 int sqlite_count_blocks(sqlite_db_t *db, int32_t devno, int ack);
 
+/*
+ * 重置所有已确认块的 ACK 状态 (ack=1 → ack=0)。
+ * 在增量同步每轮开始时调用, 触发从 live disk 重读验证。
+ *
+ * remote_id: 仅重置匹配的 remote_id 行
+ * 返回重置的行数, 错误返回 -1。
+ */
+int sqlite_reset_acked(sqlite_db_t *db, const char *remote_id);
+
 #endif /* CLIENT_SQLITE_H */
