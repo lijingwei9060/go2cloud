@@ -111,22 +111,7 @@ int volume_enumerate(volume_list_t *list) {
             /* 跳过分区长度为 0 的条目 */
             if (part->PartitionLength.QuadPart == 0) continue;
 
-            /* 跳过 MSR 分区 (GPT 保留分区, 无文件系统) */
-            if (part->PartitionStyle == PARTITION_STYLE_GPT
-                && part->Gpt.PartitionType.Data1 == 0xE3C9E316
-                && part->Gpt.PartitionType.Data2 == 0x0B5C
-                && part->Gpt.PartitionType.Data3 == 0x4DB8
-                && part->Gpt.PartitionType.Data4[0] == 0x81
-                && part->Gpt.PartitionType.Data4[1] == 0x7D
-                && part->Gpt.PartitionType.Data4[2] == 0xF9
-                && part->Gpt.PartitionType.Data4[3] == 0x2D
-                && part->Gpt.PartitionType.Data4[4] == 0xF0
-                && part->Gpt.PartitionType.Data4[5] == 0x02
-                && part->Gpt.PartitionType.Data4[6] == 0x15
-                && part->Gpt.PartitionType.Data4[7] == 0xAE) {
-                LOG_DEBUG("volume: skipping MSR partition on disk %d", n);
-                continue;
-            }
+            /* MSR 分区不再跳过，也需要传输 */
 
             volume_info_t *vol = &list->volumes[list->count];
             memset(vol, 0, sizeof(*vol));

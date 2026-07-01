@@ -62,18 +62,8 @@
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "advapi32.lib")
 #define SOCKET_ERRNO  WSAGetLastError()
-// 如果低版本 MinGW 或旧版 VS 缺少定义，手动补全
 #ifndef SE_PRIVILEGE_ENABLED
 #define SE_PRIVILEGE_ENABLED 0x00000002
-#endif
-
-#ifndef FirmwareTypeMax
-typedef enum _FIRMWARE_TYPE {
-    FirmwareTypeUnknown,
-    FirmwareTypeBios,
-    FirmwareTypeUefi,
-    FirmwareTypeMax
-} FIRMWARE_TYPE;
 #endif
 #else
 #include <sys/socket.h>
@@ -1086,6 +1076,16 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
 
     if (vss_ctx && vss_vol_count > 0) {
         snap_count = vss_create_snapshots(vss_ctx, vss_volumes, snapshots);
+        if (snap_count <= 0) {
+            LOG_ERROR("VSS: snapshot creation failed (%d snapshots), aborting",
+                      snap_count);
+            fprintf(stderr, "FATAL: VSS snapshot creation failed, "
+                    "cannot guarantee consistent backup\n");
+            vss_cleanup(vss_ctx);
+            free(data_buf);
+            sqlite_close(db);
+            return -1;
+        }
         LOG_INFO("VSS: %d snapshots created", snap_count);
 
         /* 将快照路径匹配到 vol_list */
@@ -1112,8 +1112,13 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
             }
         }
     } else {
-        LOG_INFO("VSS: no drive-letter volumes or VSS unavailable, "
-                 "using PhysicalDrive fallback");
+        LOG_ERROR("VSS: no drive-letter volumes or VSS unavailable, aborting");
+        fprintf(stderr, "FATAL: VSS not available, "
+                "cannot guarantee consistent backup\n");
+        if (vss_ctx) vss_cleanup(vss_ctx);
+        free(data_buf);
+        sqlite_close(db);
+        return -1;
     }
 
     /* ================================================================
@@ -1344,6 +1349,64 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
         LOG_INFO("partition devno=%d base=%llu complete: %llu blocks transferred",
                  entry->devno, (unsigned long long)part_base,
                  (unsigned long long)n_blocks);
+    }
+
+    /* ================================================================
+     * GPT 元数据备份: 前 1MB (主 GPT) + 末尾 2MB (备份 GPT)
+     * 对每块物理磁盘各执行一次。
+     * ================================================================ */
+    {
+        int gpt_done[16] = {0};
+        for (int d = 0; d < reader_count && g_running; d++) {
+            int devno = readers[d].devno;
+            if (gpt_done[devno]) continue;
+            gpt_done[devno] = 1;
+
+            block_reader_t *disk = readers[d].reader;
+            int need_close = 0;
+            if (readers[d].is_vss) {
+                char disk_path[64];
+                snprintf(disk_path, sizeof(disk_path),
+                         "\\\\.\\PhysicalDrive%d", devno);
+                disk = block_reader_open(disk_path);
+                if (!disk) {
+                    LOG_WARN("GPT: cannot open PhysicalDrive%d for metadata",
+                             devno);
+                    continue;
+                }
+                need_close = 1;
+            }
+
+            uint64_t disk_size = block_reader_size(disk);
+            int32_t dno = (int32_t)devno;
+
+            /* 前 1MB — 主 GPT 元数据 */
+            if (send_block(ctx, disk, db, dno, 0, 0, data_buf) == 0) {
+                sent_blocks++;
+                total_bytes += BLOCK_SIZE;
+            }
+            while (flush_one(ctx) > 0) { }
+            process_ack(ctx);
+            LOG_INFO("GPT: primary header sent (devno=%d offset=0)", devno);
+
+            /* 末尾 2MB — 备份 GPT + 对齐间隙 */
+            if (disk_size >= 2 * BLOCK_SIZE) {
+                for (int t = 2; t >= 1 && g_running; t--) {
+                    uint64_t off = disk_size - (uint64_t)t * BLOCK_SIZE;
+                    if (send_block(ctx, disk, db, dno,
+                                  off, off, data_buf) == 0) {
+                        sent_blocks++;
+                        total_bytes += BLOCK_SIZE;
+                    }
+                    while (flush_one(ctx) > 0) { }
+                    process_ack(ctx);
+                    LOG_INFO("GPT: backup footer block (devno=%d offset=%llu)",
+                             devno, (unsigned long long)off);
+                }
+            }
+
+            if (need_close) block_reader_close(disk);
+        }
     }
 
     /* ================================================================

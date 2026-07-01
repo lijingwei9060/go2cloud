@@ -190,7 +190,9 @@ int vss_create_snapshots(vss_context_t *ctx,
 
     for (int i = 0; i < VSS_MAX_VOLUMES && volumes[i] != NULL; i++) {
         WCHAR wide_vol[64];
-        MultiByteToWideChar(CP_ACP, 0, volumes[i], -1, wide_vol, 64);
+        char vol_with_slash[64];
+        snprintf(vol_with_slash, sizeof(vol_with_slash), "%s\\", volumes[i]);
+        MultiByteToWideChar(CP_ACP, 0, vol_with_slash, -1, wide_vol, 64);
 
         VSS_ID snapshot_id;
         hr = bc->AddToSnapshotSet(wide_vol, GUID_NULL, &snapshot_id);
