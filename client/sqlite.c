@@ -61,6 +61,9 @@ struct sqlite_db {
 #define SQL_COUNT_UNACKED \
     "SELECT COUNT(*) FROM T_BLOCK WHERE ack=0 AND remote_id=?"
 
+#define SQL_RESET_ACKED \
+    "UPDATE T_BLOCK SET ack=0 WHERE ack=1 AND remote_id=?"
+
 sqlite_db_t *sqlite_open(const char *db_path) {
     sqlite3 *handle = NULL;
     int rc = sqlite3_open(db_path, &handle);

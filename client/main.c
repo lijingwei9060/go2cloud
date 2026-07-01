@@ -162,6 +162,7 @@ typedef struct {
     int           server_done_rcvd;  /* 1 = 已收到 SERVER_DONE */
     int           inc_round;         /* 增量轮次计数 */
     int           zero_change_rounds;/* 连续无变化轮次数 */
+    int           final_verify;      /* 1 = 正在执行最终验证轮 */
 } migrate_ctx_t;
 
 /* ================================================================
