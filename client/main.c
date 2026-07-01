@@ -1024,6 +1024,9 @@ static int do_incremental_round(migrate_ctx_t *ctx,
         if (new_hash == old_hash) {
             /* 块未变化 — live disk 与已发送数据一致, 标记为稳定 (ack=1) */
             sqlite_block_mark_acked(db, devno, (int64_t)disk_offset);
+            /* 更新 last_sent: 确保 ORDER BY last_sent 将此块排到队尾,
+             * 让本轮尚未检查的块 (如高 offset 的 D 盘) 下轮优先被选中 */
+            sqlite_update_last_sent(db, devno, (int64_t)disk_offset, now_ms);
             continue;
         }
 

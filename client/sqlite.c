@@ -49,11 +49,11 @@ struct sqlite_db {
 
 #define SQL_GET_UNACKED \
     "SELECT devno, offset FROM T_BLOCK WHERE ack=0 AND remote_id=? " \
-    "ORDER BY offset LIMIT ?"
+    "ORDER BY last_sent, offset LIMIT ?"
 
 #define SQL_GET_UNACKED_WITH_HASH \
     "SELECT devno, offset, hash, last_sent FROM T_BLOCK " \
-    "WHERE ack=0 AND remote_id=? ORDER BY offset LIMIT ?"
+    "WHERE ack=0 AND remote_id=? ORDER BY last_sent, offset LIMIT ?"
 
 #define SQL_UPDATE_LAST_SENT \
     "UPDATE T_BLOCK SET last_sent=? WHERE devno=? AND offset=?"
