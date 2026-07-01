@@ -541,8 +541,8 @@ static int send_block(migrate_ctx_t *ctx, block_reader_t *reader,
     /* 计算哈希 (使用 disk_offset 的低 32 位作为种子的组成部分) */
     uint64_t h = hash_block(data_buf, data_len, disk_offset & 0xFFFFFFFF);
 
-    /* 增量去重: 查询 SQLite */
-    if (ctx->zstd_level > 0) {  /* 仅增量模式下查询 */
+    /* 增量去重: 仅 TailSend 模式下查询 SQLite 对比 hash */
+    if (ctx->tail_send) {
         uint64_t stored_hash = 0;
         if (sqlite_block_lookup(db, devno, (int64_t)disk_offset, &stored_hash) == 0) {
             if (stored_hash == h) {
@@ -656,6 +656,7 @@ typedef struct {
     block_reader_t *live_reader;      /* 增量同步读取器 (始终 PhysicalDrive) */
     int32_t         devno;             /* 所在物理磁盘编号 */
     uint64_t        partition_offset;  /* 分区在磁盘上的绝对偏移 */
+    uint64_t        block_count;       /* 分区实际块数 (非全盘) */
     int             is_vss;            /* 1 = 读取器打开 VSS 快照路径, 0 = PhysicalDrive */
 } reader_entry_t;
 
@@ -1126,6 +1127,7 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
             entry->reader           = r;
             entry->devno            = vol->devno;
             entry->partition_offset = vol->partition_offset;
+            entry->block_count      = vol->block_count;
             entry->is_vss           = use_vss;
             entry->live_reader      = NULL;
 
@@ -1198,13 +1200,32 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
         reader_entry_t *entry = &readers[d];
         block_reader_t *reader = entry->reader;
         uint64_t part_base = entry->partition_offset;
-        uint64_t n_blocks = block_reader_block_count(reader, (uint32_t)BLOCK_SIZE);
+        uint64_t n_blocks = entry->block_count;
+
+        /* 裁切: block_count 来自分区表, 可能超出物理磁盘边界 */
+        uint64_t disk_end = block_reader_size(reader);
+        if (disk_end > part_base) {
+            uint64_t max_blocks = (disk_end - part_base) / BLOCK_SIZE;
+            if (n_blocks > max_blocks) {
+                LOG_WARN("partition %d: clamping block count %llu → %llu "
+                         "(partition exceeds disk boundary)",
+                         d, (unsigned long long)n_blocks,
+                         (unsigned long long)max_blocks);
+                n_blocks = max_blocks;
+            }
+        } else {
+            LOG_ERROR("partition %d: offset %llu beyond disk end %llu, skipping",
+                      d, (unsigned long long)part_base,
+                      (unsigned long long)disk_end);
+            n_blocks = 0;
+        }
 
         LOG_INFO("partition devno=%d base=%llu: %llu blocks to transfer",
                  entry->devno, (unsigned long long)part_base,
                  (unsigned long long)n_blocks);
         total_blocks += n_blocks;
 
+        __try {
         for (uint64_t blk = 0; blk < n_blocks && g_running; blk++) {
             uint64_t disk_offset   = part_base + blk * BLOCK_SIZE;
             uint64_t reader_offset = entry->is_vss
@@ -1239,6 +1260,12 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
             process_ack(ctx);
 
             /* 定时器检查 */
+            if (blk > 0 && blk % 5000 == 0) {
+                LOG_INFO("checkpoint: blk=%llu sent=%llu queue=%d",
+                         (unsigned long long)blk,
+                         (unsigned long long)sent_blocks,
+                         queue_count(&ctx->queue));
+            }
             uint64_t now = timer_now_ms();
             timer_event_t ev;
             while ((ev = timer_check(&ctx->timer, now)) != TIMER_NONE) {
@@ -1259,7 +1286,7 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
                     do_retransmit(ctx, db, readers, reader_count, data_buf);
                     break;
                 case TIMER_RECONNECT:
-                    do_reconnect(ctx);
+                    if (!ctx->dry_run) do_reconnect(ctx);
                     break;
                 case TIMER_ACTION:
                     LOG_INFO("progress: partition %d/%d block %llu/%llu "
@@ -1278,6 +1305,14 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
                 timer_reset(&ctx->timer, ev);
                 now = timer_now_ms();
             }
+        }
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            LOG_ERROR("FATAL: exception 0x%08lx in transfer loop",
+                      (unsigned long)GetExceptionCode());
+            fprintf(stderr, "FATAL: crash in transfer loop, code=0x%08lx\n",
+                    (unsigned long)GetExceptionCode());
+            fflush(stderr);
+            return -1;
         }
 
         LOG_INFO("partition devno=%d base=%llu complete: %llu blocks transferred",
@@ -1351,7 +1386,7 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
                     do_retransmit(ctx, db, readers, reader_count, data_buf);
                     break;
                 case TIMER_RECONNECT:
-                    do_reconnect(ctx);
+                    if (!ctx->dry_run) do_reconnect(ctx);
                     break;
                 case TIMER_ACTION:
                     LOG_INFO("incremental: round %d/%d, %d unacked blocks, "
@@ -1485,7 +1520,7 @@ static int cmd_dryrun(int argc, char *argv[]) {
     }
 
     /* 打印磁盘信息 */
-    printf("Dry-run mode — no server connection needed\n");
+    printf("Dry-run mode -- no server connection needed\n");
     printf("%-6s %-8s %-16s %s\n", "Disk", "Size(GB)", "TotalBlocks", "Name");
     printf("------ ------ ---------------- ----\n");
     for (int i = 0; i < vol_list.count; i++) {
@@ -1511,7 +1546,6 @@ static int cmd_dryrun(int argc, char *argv[]) {
 
     time_t start_time = time(NULL);
 
-    /* 执行迁移 (所有网络 I/O 在 dry_run=1 下自动 Mock) */
     int rc = do_migrate(&ctx, &vol_list);
 
     time_t end_time = time(NULL);
