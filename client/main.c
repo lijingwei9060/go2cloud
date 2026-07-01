@@ -163,6 +163,7 @@ typedef struct {
     int           inc_round;         /* 增量轮次计数 */
     int           zero_change_rounds;/* 连续无变化轮次数 */
     int           final_verify;      /* 1 = 正在执行最终验证轮 */
+    int           dry_run;           /* 1 = dry-run mode, no network I/O */
 } migrate_ctx_t;
 
 /* ================================================================
@@ -460,6 +461,19 @@ static int cmd_check(const char *disk_path) {
  * 非阻塞: 无数据时立即返回。
  */
 static void process_ack(migrate_ctx_t *ctx) {
+    if (ctx->dry_run) {
+        int32_t  devnos[256];
+        int64_t  offsets[256];
+        int n = queue_get_pending(&ctx->queue, devnos, offsets, 256);
+        for (int i = 0; i < n; i++) {
+            queue_ack(&ctx->queue, devnos[i], offsets[i]);
+            if (ctx->db && !ctx->tail_send) {
+                sqlite_block_mark_acked(ctx->db, devnos[i], offsets[i]);
+            }
+        }
+        return;
+    }
+
     server_response_t resp;
 
     for (int i = 0; i < SOCKET_POOL_TARGET; i++) {
@@ -597,6 +611,14 @@ static int flush_one(migrate_ctx_t *ctx) {
     queue_entry_t entry;
     if (queue_pop(&ctx->queue, &entry) != 0) {
         return 0; /* 队列空 */
+    }
+
+    if (ctx->dry_run) {
+        queue_ack(&ctx->queue, entry.devno, entry.offset);
+        if (ctx->db && !ctx->tail_send) {
+            sqlite_block_mark_acked(ctx->db, entry.devno, entry.offset);
+        }
+        return 1;
     }
 
     /* 获取一个连接 */
@@ -878,6 +900,17 @@ static int do_incremental_round(migrate_ctx_t *ctx,
  * 返回 1 表示 allDone 已设置, 0 表示失败需重试。
  */
 static int timer_cb_real(migrate_ctx_t *ctx) {
+    if (ctx->dry_run) {
+        /* 排空队列 */
+        while (queue_count(&ctx->queue) > 0 && g_running) {
+            while (flush_one(ctx) > 0) { }
+            process_ack(ctx);
+        }
+        ctx->all_done = 1;
+        LOG_INFO("dry-run: allDone set, migration complete");
+        return 1;
+    }
+
     /* 排空队列: 确保所有块都已发送 */
     while (queue_count(&ctx->queue) > 0 && g_running) {
         while (flush_one(ctx) > 0) { }
@@ -1143,7 +1176,7 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
     /* ================================================================
      * 增量模式: 发送 ctlIncremental
      * ================================================================ */
-    if (ctx->tail_send) {
+    if (ctx->tail_send && !ctx->dry_run) {
         pool_conn_t *c = pool_acquire(&ctx->pool);
         if (c) {
             wire_send_control(c->fd, CTL_INCREMENTAL, CTL_INCREMENTAL_LEN);
@@ -1356,20 +1389,22 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
         }
     } else {
         /* 非增量模式: 发送 ctlEndIncremental 结束传输 */
-        pool_conn_t *c = pool_acquire(&ctx->pool);
-        if (c) {
-            wire_send_control(c->fd, CTL_END_INCREMENTAL, CTL_END_INCREMENTAL_LEN);
-            pool_touch(c);
-            pool_release(&ctx->pool, c);
-            LOG_INFO("sent ctlEndIncremental");
+        if (!ctx->dry_run) {
+            pool_conn_t *c = pool_acquire(&ctx->pool);
+            if (c) {
+                wire_send_control(c->fd, CTL_END_INCREMENTAL, CTL_END_INCREMENTAL_LEN);
+                pool_touch(c);
+                pool_release(&ctx->pool, c);
+                LOG_INFO("sent ctlEndIncremental");
 
-            for (int w = 0; w < 300; w++) {
-                process_ack(ctx);
+                for (int w = 0; w < 300; w++) {
+                    process_ack(ctx);
 #ifdef _WIN32
-                Sleep(100);
+                    Sleep(100);
 #else
-                usleep(100000);
+                    usleep(100000);
 #endif
+                }
             }
         }
     }
@@ -1399,6 +1434,105 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
 }
 
 /* ================================================================
+ * 子命令: dryrun — 本地模拟全量+增量迁移, 无网络 I/O
+ * ================================================================ */
+
+static int cmd_dryrun(int argc, char *argv[]) {
+    const char *config_path = (argc >= 3) ? argv[2] : "user.json";
+    char *config_json = read_file_all(config_path);
+
+    int log_level    = LOG_LEVEL_INFO;
+    int zstd_level   = ZSTD_COMPRESS_LEVEL_MAX;
+    int tail_send    = 0;
+    char log_path[256] = {0};
+    char db_path[512]  = "tracker.db";
+
+    migrate_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.dry_run = 1;
+
+    if (config_json) {
+        const char *log_section = json_nav(config_json, "Log");
+        if (log_section) {
+            log_level = json_read_int(log_section, "Level", LOG_LEVEL_INFO);
+            json_read_str(log_section, "Path", log_path, sizeof(log_path));
+        }
+
+        tail_send  = json_read_int(config_json, "TailSend", 0);
+        zstd_level = tail_send ? ZSTD_COMPRESS_LEVEL_MIN : ZSTD_COMPRESS_LEVEL_MAX;
+
+        json_read_str(config_json, "DbPath", db_path, sizeof(db_path));
+
+        free(config_json);
+    }
+
+    ctx.zstd_level = zstd_level;
+    ctx.tail_send  = tail_send;
+    snprintf(ctx.db_path, sizeof(ctx.db_path), "%s", db_path);
+
+    /* 初始化日志 */
+    log_init(log_level, log_path[0] ? log_path : NULL);
+    LOG_INFO("go2cloud client dry-run starting...");
+    LOG_INFO("mode: %s (zstd level %d, no network I/O)",
+             tail_send ? "incremental" : "full", zstd_level);
+
+    /* 枚举卷 */
+    volume_list_t vol_list;
+    if (volume_enumerate(&vol_list) != 0) {
+        LOG_ERROR("no disks found");
+        log_close();
+        return 1;
+    }
+
+    /* 打印磁盘信息 */
+    printf("Dry-run mode — no server connection needed\n");
+    printf("%-6s %-8s %-16s %s\n", "Disk", "Size(GB)", "TotalBlocks", "Name");
+    printf("------ ------ ---------------- ----\n");
+    for (int i = 0; i < vol_list.count; i++) {
+        volume_info_t *v = &vol_list.volumes[i];
+        printf("%-6d %-8.2f %-16llu %s\n",
+               v->devno,
+               (double)v->total_bytes / (1024.0 * 1024.0 * 1024.0),
+               (unsigned long long)v->block_count, v->name);
+    }
+    printf("\n");
+
+    /* 初始化模块 (跳过网络相关) */
+    msgpack_writer_init(&ctx.mp_writer);
+    queue_init(&ctx.queue);
+    timer_init(&ctx.timer);
+
+    /* 注册信号处理 */
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+
+    /* 随机数种子 */
+    srand((unsigned int)time(NULL));
+
+    time_t start_time = time(NULL);
+
+    /* 执行迁移 (所有网络 I/O 在 dry_run=1 下自动 Mock) */
+    int rc = do_migrate(&ctx, &vol_list);
+
+    time_t end_time = time(NULL);
+    double elapsed = difftime(end_time, start_time);
+
+    printf("\n");
+    printf("========== Dry-Run Results ==========\n");
+    printf("  Mode:       %s\n", tail_send ? "incremental (TailSend)" : "full");
+    printf("  Status:     %s\n", rc == 0 ? "SUCCESS" : "FAILED");
+    printf("  Duration:   %.0f seconds\n", elapsed);
+    printf("======================================\n");
+
+    /* 清理 */
+    queue_destroy(&ctx.queue);
+    msgpack_writer_free(&ctx.mp_writer);
+    log_close();
+
+    return rc;
+}
+
+/* ================================================================
  * 入口
  * ================================================================ */
 
@@ -1419,6 +1553,7 @@ int main(int argc, char *argv[]) {
         printf("  %s vss_query                  List all existing snapshots\n", argv[0]);
         printf("  %s vss_delete <guid>          Delete specific snapshot\n", argv[0]);
         printf("  %s vss_delete --all           Delete all snapshots\n", argv[0]);
+        printf("  %s dryrun [config.json]       Simulate full migration locally\n", argv[0]);
         printf("  %s --help                     Show this help\n", argv[0]);
         return 0;
     }
@@ -1438,6 +1573,7 @@ int main(int argc, char *argv[]) {
         printf("  %s vss_query\n", argv[0]);
         printf("  %s vss_delete <guid>\n", argv[0]);
         printf("  %s vss_delete --all\n", argv[0]);
+        printf("  %s dryrun [config.json]\n", argv[0]);
         printf("\nConfig file defaults to user.json\n");
         return 0;
     }
@@ -1475,6 +1611,9 @@ int main(int argc, char *argv[]) {
     }
     if (strcmp(argv[1], "vss_delete") == 0) {
         return cmd_vss_delete(argc, argv);
+    }
+    if (strcmp(argv[1], "dryrun") == 0) {
+        return cmd_dryrun(argc, argv);
     }
 
     /* ————— 迁移模式 ————— */

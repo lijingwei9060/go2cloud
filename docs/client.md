@@ -35,6 +35,7 @@ client.exe test_vss               # 测试 VSS 快照功能（创建持久快照
 client.exe vss_query              # 查询所有现有快照
 client.exe vss_delete <guid>      # 删除指定快照
 client.exe vss_delete --all       # 删除所有快照
+client.exe dryrun [config.json]   # 本地模拟全量+增量迁移，无网络 I/O
 client.exe --help                 # 显示帮助
 ```
 
@@ -186,6 +187,77 @@ client.exe end_session          # 清理 tracker.db → DELETE FROM T_BLOCK
 client.exe check \\.\PhysicalDrive0          # 检查磁盘可读性
 client.exe hash C:\data\block.bin            # 计算块级哈希
 ```
+
+### 3.9 dryrun — 本地模拟迁移（无服务端）
+
+```
+client.exe dryrun [config.json]
+```
+
+在本地模拟完整的全量 + 增量迁移流程，**不需要服务端交互，不需要配置服务端地址**。所有网络 I/O 被 Mock，服务端 ACK 自动合成。适用于：
+
+- 验证完整迁移流水线（读 → 哈希 → SQLite 去重 → 编码 → ACK）无需部署服务端
+- 本地性能基准测试（读盘、哈希计算、SQLite 吞吐）
+- 增量收敛逻辑调试
+
+**运行流程**：
+
+1. 读取配置文件（同真实迁移模式）
+2. 枚举本地磁盘分区，打印磁盘信息
+3. 初始化内部模块（queue、timer、SQLite），**跳过网络连接**
+4. 执行 `do_migrate()` — 与真实迁移完全相同的流水线：
+   - 打开磁盘读取器（VSS 快照优先，回退 PhysicalDrive）
+   - 全量传输：逐块读取 → 计算哈希 → SQLite 去重 → 模拟发送 → 立即合成 ACK → 标记 `ack=1`
+   - 18s 增量定时器：从 live disk 重读、哈希对比、重发变化块
+   - TailSend=1 时进入增量收敛循环
+5. 打印统计信息：耗时、模式、状态
+
+**Mock 机制**：
+
+| 函数 | 真实行为 | Dry-run 行为 |
+|------|---------|-------------|
+| `pool_init` | TCP 连接服务端 | 跳过 |
+| `flush_one` | 出队 → wire_send → 释放连接 | 出队 → 立即合成 ACK → 标记 SQLite ack=1 |
+| `process_ack` | 轮询所有连接接收 20B 响应 | 扫描队列中所有待确认条目 → 合成 ACK → 标记 ack=1 |
+| `wire_send` | MsgPack → Zstd → "abc" → TCP 帧 → send() | 跳过（块数据仍完成 MsgPack 编码） |
+| `wire_send_control` | 发送控制字符串（ctlIncremental 等） | 跳过 |
+| `timer_cb_real` | 发送 ctlEndIncremental，等待 300s SERVER_DONE | 直接设置 allDone=1 |
+
+**内部模块保持不变**：queue、timer、SQLite、hash、msgpack、volume、block_io、vss — 全部按真实模式运行。
+
+**输出示例**：
+
+```
+Dry-run mode — no server connection needed
+Disk   Size(GB) TotalBlocks      Name
+------ ------ ---------------- ----
+0      50.00    51200            C:
+1      100.00   102400           D:
+
+[INFO ] go2cloud client dry-run starting...
+[INFO ] mode: full (zstd level 7, no network I/O)
+[INFO ] partition C:: 51200 blocks via VSS
+[INFO ] partition D:: 102400 blocks via PhysicalDrive
+[INFO ] starting block transfer: 2 partitions
+[INFO ] progress: partition 1/2 block 10000/51200 sent=10000/153600 queue=5
+...
+[INFO ] migration complete: 153600 blocks, 161061273600 bytes
+
+========== Dry-Run Results ==========
+  Mode:       full
+  Status:     SUCCESS
+  Duration:   42 seconds
+======================================
+```
+
+**配置**：与真实迁移相同，使用 `user.json`：
+- `TailSend: 1` → 全量 + 增量收敛循环
+- `TailSend: 0` → 仅全量同步
+- `DbPath` → 指定 SQLite 跟踪数据库路径（默认 `tracker.db`）
+
+**权限**：需要管理员权限（与真实迁移一致，PhysicalDrive 访问要求）。
+
+**退出码**：0 成功，1 失败（无磁盘可访问）。
 
 ---
 
@@ -461,6 +533,8 @@ Go 控制端（go2tencentcloud）
 ├─ client.exe vss_delete <guid> → 删除迁移快照
 │
 └─ client.exe vss_delete --all  → 清理所有快照
+│
+└─ client.exe dryrun [config]   → 本地模拟迁移（验证流水线 / 性能基准）
 ```
 
 ---

@@ -82,19 +82,24 @@ $(CLIENT_BIN): $(CLIENT_SRC) include/protocol.h
 # ============================================================
 
 client_msvc:
-	cl /O2 /Fe:client.exe \
+	cl /c /O2 /utf-8 \
 	   client\main.c client\log.c client\hash.c client\msgpack.c \
 	   client\wire.c client\queue.c client\pool.c client\timer.c \
-	   client\sqlite.c client\volume.c client\block_io.c client\vss.c \
-	   /Iinclude \
-	   /link libzstd.lib sqlite3.lib ole32.lib vssapi.lib ws2_32.lib
+	   client\sqlite.c client\volume.c client\block_io.c \
+	   /Iinclude /Id:\vcpkg\installed\x64-windows\include
+	cl /c /O2 /utf-8 /Tpclient\vss.c \
+	   /Iinclude /Id:\vcpkg\installed\x64-windows\include
+	link /OUT:client.exe main.obj log.obj hash.obj msgpack.obj wire.obj \
+	   queue.obj pool.obj timer.obj sqlite.obj volume.obj block_io.obj vss.obj \
+	   /LIBPATH:d:\vcpkg\installed\x64-windows\lib \
+	   zstd.lib sqlite3.lib ole32.lib vssapi.lib ws2_32.lib
 
 server_msvc:
-	cl /O2 /Fe:receiver.exe \
+	cl /O2 /utf-8 /Fe:receiver.exe \
 	   server\main.c server\log.c server\session.c \
 	   server\block_writer.c server\protocol_decoder.c server\ack.c \
-	   /Iinclude \
-	   /link libzstd.lib ws2_32.lib
+	   /Iinclude /Id:\vcpkg\installed\x64-windows\include \
+	   /link /LIBPATH:d:\vcpkg\installed\x64-windows\lib zstd.lib ws2_32.lib
 
 # ============================================================
 # 清理
