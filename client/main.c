@@ -62,6 +62,19 @@
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "advapi32.lib")
 #define SOCKET_ERRNO  WSAGetLastError()
+// 如果低版本 MinGW 或旧版 VS 缺少定义，手动补全
+#ifndef SE_PRIVILEGE_ENABLED
+#define SE_PRIVILEGE_ENABLED 0x00000002
+#endif
+
+#ifndef FirmwareTypeMax
+typedef enum _FIRMWARE_TYPE {
+    FirmwareTypeUnknown,
+    FirmwareTypeBios,
+    FirmwareTypeUefi,
+    FirmwareTypeMax
+} FIRMWARE_TYPE;
+#endif
 #else
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -324,10 +337,12 @@ static int cmd_isbios(void) {
             tp.Privileges[0].Luid = luid;
             tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
             AdjustTokenPrivileges(token, FALSE, &tp, 0, NULL, NULL);
+            // 严格来说这里可以用 GetLastError() == ERROR_SUCCESS 校验，但即使失败也可以继续往下走
         }
         CloseHandle(token);
     }
 
+    /* 2. 优先使用 GetFirmwareType (Windows 8 / Server 2012 以上) */
     /*
      * GetFirmwareType (Windows 8+):
      *   FirmwareTypeBios = 1 → Legacy BIOS
@@ -340,28 +355,39 @@ static int cmd_isbios(void) {
     HMODULE k32 = GetModuleHandleA("kernel32.dll");
     if (k32) {
         BOOL (WINAPI *pfnGetFirmwareType)(FIRMWARE_TYPE *) =
-            (void *)GetProcAddress(k32, "GetFirmwareType");
+            (BOOL (WINAPI *)(FIRMWARE_TYPE *))GetProcAddress(k32, "GetFirmwareType");
         if (pfnGetFirmwareType && pfnGetFirmwareType(&ft)) {
-            is_uefi = (ft == FirmwareTypeUefi);
+            if (ft == FirmwareTypeUefi) {
+                is_uefi = 1;
+            } else if (ft == FirmwareTypeBios) {
+                is_uefi = 0;
+            }
         }
     }
 
-    if (!is_uefi && ft == FirmwareTypeUnknown) {
-        /*
-         * 回退: 探测 UEFI 变量命名空间。
-         * 非 UEFI 系统上 GetFirmwareEnvironmentVariableA 返回失败
-         * (ERROR_INVALID_FUNCTION)。
-         */
-        if (GetFirmwareEnvironmentVariableA(
-                "{00000000-0000-0000-0000-000000000000}",
-                "{00000000-0000-0000-0000-000000000000}",
-                NULL, 0) > 0) {
+   /* 3. 回退方案: 如果 GetFirmwareType 无法确定 (如 Win7), 探测 UEFI 变量 */
+    if (ft == FirmwareTypeUnknown) {
+        DWORD result = GetFirmwareEnvironmentVariableA("",
+            "{00000000-0000-0000-0000-000000000000}", NULL, 0);
+        if (result == 0) {
+            // 调用失败才检查错误码: ERROR_INVALID_FUNCTION = 固件不支持 = Legacy BIOS
+            if (GetLastError() != ERROR_INVALID_FUNCTION) {
+                is_uefi = 1;
+            }
+        } else {
             is_uefi = 1;
         }
     }
 
     printf("%s\n", is_uefi ? "UEFI" : "Legacy");
 #else
+    // 跨平台处理（例如 Linux）
+    #if defined(__linux__)
+    if (access("/sys/firmware/efi", F_OK) == 0) {
+        printf("UEFI\n");
+        return 1;
+    }
+    #endif
     printf("Legacy\n");
 #endif
     return 0;
