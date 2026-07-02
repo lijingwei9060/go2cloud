@@ -187,6 +187,133 @@ typedef struct {
 } migrate_ctx_t;
 
 /* ================================================================
+ * 子命令: dcbt_status — 显示 DCBT 驱动脏块位图和统计信息
+ * ================================================================ */
+
+static int cmd_dcbt_status(int argc, char *argv[]) {
+	int show_raw = 0;
+	int disk_filter = -1;
+
+	for (int i = 2; i < argc; i++) {
+		if (strcmp(argv[i], "--raw") == 0)
+			show_raw = 1;
+		else
+			disk_filter = atoi(argv[i]);
+	}
+
+	dcbt_t dcbt;
+	if (dcbt_open(&dcbt) != 0) {
+		printf("DCBT driver not available (go2cloud_flt.sys not loaded)\n");
+		printf("\nCheck:\n");
+		printf("  driverquery /v | findstr go2cloud\n");
+		printf("  bcdedit /enum | findstr testsigning\n");
+		return 1;
+	}
+
+	GO2CLOUD_VERSION ver = {0};
+	DWORD bytes = 0;
+	if (DeviceIoControl(dcbt.hDevice, IOCTL_GO2CLOUD_GET_VERSION,
+	                    NULL, 0, &ver, sizeof(ver), &bytes, NULL)) {
+		printf("DCBT Driver Version: %hu.%hu.%hu\n",
+		       ver.Major, ver.Minor, ver.Patch);
+	}
+
+	volume_list_t vol_list;
+	memset(&vol_list, 0, sizeof(vol_list));
+	if (volume_enumerate(&vol_list) != 0) {
+		printf("No fixed disks found (run as Administrator?)\n");
+		dcbt_close(&dcbt);
+		return 1;
+	}
+
+	int shown = 0;
+	for (int i = 0; i < vol_list.count; i++) {
+		volume_info_t *v = &vol_list.volumes[i];
+		if (disk_filter >= 0 && v->devno != disk_filter)
+			continue;
+
+		ULONG total_blocks = 0, bm_size = 0;
+		if (dcbt_query_bitmap_size(&dcbt, (ULONG)v->devno,
+		                           &total_blocks, &bm_size) != 0) {
+			printf("\nDisk %d (%s): query failed\n", v->devno, v->name);
+			continue;
+		}
+
+		/* buffer must hold GO2CLOUD_BITMAP header + Bitmap payload */
+		ULONG alloc_size = FIELD_OFFSET(GO2CLOUD_BITMAP, Bitmap) + bm_size;
+		void *bm_buf = malloc(alloc_size);
+		if (!bm_buf) {
+			printf("\nDisk %d: out of memory\n", v->devno);
+			continue;
+		}
+
+		ULONG dirty_blocks = 0;
+		if (dcbt_get_bitmap(&dcbt, (ULONG)v->devno,
+		                    bm_buf, alloc_size, &dirty_blocks) != 0) {
+			free(bm_buf);
+			printf("\nDisk %d: get_bitmap failed\n", v->devno);
+			continue;
+		}
+
+		GO2CLOUD_BITMAP *bm = (GO2CLOUD_BITMAP *)bm_buf;
+
+		GO2CLOUD_STATS stats = {0};
+		dcbt_get_stats(&dcbt, (ULONG)v->devno, &stats);
+
+		printf("\n");
+		printf("========================================================\n");
+		printf("  Disk %d: %s  (%s)\n", v->devno, v->name, v->disk_path);
+		printf("--------------------------------------------------------\n");
+		printf("  Total size:      %10.2f GB\n",
+		       (double)v->total_bytes / (1024.0 * 1024.0 * 1024.0));
+		printf("  Total blocks:    %10lu  (1 MB each)\n",
+		       (unsigned long)bm->TotalBlocks);
+		printf("  Dirty blocks:    %10lu  (%.2f%%)\n",
+		       (unsigned long)dirty_blocks,
+		       bm->TotalBlocks > 0
+		           ? (double)dirty_blocks * 100.0 / bm->TotalBlocks
+		           : 0.0);
+		printf("  Bitmap size:     %10lu bytes\n",
+		       (unsigned long)bm_size);
+		printf("--------------------------------------------------------\n");
+		printf("  Write count:     %10llu\n",
+		       (unsigned long long)stats.TotalWrites);
+		printf("  Bytes written:   %10llu  (%.2f GB)\n",
+		       (unsigned long long)stats.TotalBytesWritten,
+		       (double)stats.TotalBytesWritten / (1024.0 * 1024.0 * 1024.0));
+
+		if (dirty_blocks > 0 && show_raw) {
+			printf("--------------------------------------------------------\n");
+			printf("  Dirty block indexes (1 MB units):\n");
+			int per_line = 0;
+			for (ULONG bi = 0; bi < bm->TotalBlocks; bi++) {
+				if (dcbt_is_block_dirty(bm->Bitmap, bi)) {
+					printf("  %lu", (unsigned long)bi);
+					if (++per_line >= 16) {
+						printf("\n");
+						per_line = 0;
+					}
+				}
+			}
+			if (per_line > 0) printf("\n");
+		}
+
+		free(bm_buf);
+		shown++;
+	}
+
+	if (shown == 0) {
+		if (disk_filter >= 0)
+			printf("Disk %d not found.\n", disk_filter);
+		else
+			printf("No disks tracked by DCBT driver.\n");
+	}
+
+	dcbt_close(&dcbt);
+	return 0;
+}
+
+/* ================================================================
  * 子命令: info — 显示磁盘信息
  * ================================================================ */
 
@@ -2793,6 +2920,7 @@ int main(int argc, char *argv[]) {
         printf("Usage:\n");
         printf("  %s <ip:port> [config.json]    Run migration\n", argv[0]);
         printf("  %s info                       Show disk information\n", argv[0]);
+        printf("  %s dcbt_status [disk] [--raw] Show DCBT dirty bitmap and stats\n", argv[0]);
         printf("  %s hash <file>                Compute block hash\n", argv[0]);
         printf("  %s check <disk>               Check disk accessibility\n", argv[0]);
         printf("  %s isbios                     Detect firmware type (UEFI/Legacy)\n", argv[0]);
@@ -2820,6 +2948,7 @@ int main(int argc, char *argv[]) {
         printf("Usage:\n");
         printf("  %s <ip:port> [config.json]\n", argv[0]);
         printf("  %s info\n", argv[0]);
+        printf("  %s dcbt_status [disk] [--raw]\n", argv[0]);
         printf("  %s hash <file>\n", argv[0]);
         printf("  %s check <disk>\n", argv[0]);
         printf("  %s isbios\n", argv[0]);
@@ -2846,6 +2975,9 @@ int main(int argc, char *argv[]) {
     /* 子命令 */
     if (strcmp(argv[1], "info") == 0) {
         return cmd_info();
+    }
+    if (strcmp(argv[1], "dcbt_status") == 0) {
+        return cmd_dcbt_status(argc, argv);
     }
     if (strcmp(argv[1], "hash") == 0 && argc >= 3) {
         return cmd_hash(argv[2]);
