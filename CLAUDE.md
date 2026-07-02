@@ -36,6 +36,8 @@ go2cloud/
 │   ├── volume.c/.h           — Disk enumeration (PhysicalDriveN on Win, /dev/sdX on Linux)
 │   ├── block_io.c/.h         — Block-level disk read (Win32 CreateFile, Linux open/pread64)
 │   ├── vss.c/.h              — VSS snapshot management (Windows-only, COM)
+│   ├── driver_inject.c/.h    — VirtIO driver pre-install for KVM migration (Windows-only, Setup API)
+│   ├── syschk.c/.h           — Pre-migration system environment check (admin, VSS, disks, drivers)
 │   ├── hash.c/.h             — Custom 64-bit xxHash-like hash
 │   ├── msgpack.c/.h          — MsgPack encoder (fixmap(3) block messages)
 │   ├── wire.c/.h             — 4-layer wire protocol: TCP 4B BE len → "abc" magic → Zstd → MsgPack
@@ -56,7 +58,9 @@ go2cloud/
 │   ├── architecture.md       — Architecture overview
 │   ├── client.md             — Client design doc
 │   ├── protocol.md           — Wire protocol spec
-│   └── receiver.md           — Receiver usage manual
+│   ├── receiver.md           — Receiver usage manual
+│   ├── driver_inject.md      — VirtIO driver injection guide
+│   └── system_check.md       — Pre-migration check reference
 └── Makefile                  — Cross-platform build (GCC / MSVC targets)
 ```
 
@@ -82,6 +86,10 @@ client.exe vss_query               — List existing VSS snapshots
 client.exe vss_delete <guid>       — Delete specific snapshot
 client.exe vss_delete --all        — Delete all snapshots
 client.exe dryrun [config.json]    — Dry-run: simulate full migration locally (no server)
+client.exe incsync <ip:port> [cfg] — Single-pass incremental sync
+client.exe checkenv [driver_dir]   — Full pre-migration system environment check
+client.exe check_drivers [dir]     — Check if VirtIO drivers are pre-installed
+client.exe inject_driver [dir]     — Pre-install VirtIO drivers into driver store
 client.exe <ip:port> [config.json] — Real migration
 ```
 

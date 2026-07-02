@@ -46,7 +46,7 @@ if %ERRORLEVEL% neq 0 (
 )
 
 REM Compile remaining client C files
-cl /O2 /utf-8 /Fe:client.exe client\block_io.c client\hash.c client\log.c client\main.c client\msgpack.c client\pool.c client\queue.c client\sqlite.c client\timer.c client\volume.c client\wire.c vss.obj /Iinclude /I%VCPKG%\include /link zstd.lib sqlite3.lib ole32.lib vssapi.lib ws2_32.lib /LIBPATH:%VCPKG%\lib
+cl /O2 /utf-8 /Fe:client.exe client\block_io.c client\hash.c client\log.c client\main.c client\msgpack.c client\pool.c client\queue.c client\sqlite.c client\timer.c client\volume.c client\wire.c client\driver_inject.c client\syschk.c vss.obj /Iinclude /I%VCPKG%\include /link zstd.lib sqlite3.lib ole32.lib vssapi.lib ws2_32.lib /LIBPATH:%VCPKG%\lib
 if %ERRORLEVEL% neq 0 (
     echo [FAIL] client.exe build failed
     goto :end

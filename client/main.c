@@ -47,6 +47,8 @@
 #include "volume.h"
 #include "block_io.h"
 #include "vss.h"
+#include "driver_inject.h"
+#include "syschk.h"
 #include "../include/protocol.h"
 
 #include <stdio.h>
@@ -631,6 +633,100 @@ static int cmd_isbios(void) {
 
 static int cmd_begin_session(void) {
     return 0;
+}
+
+/* ================================================================
+ * 子命令: inject_driver <driver_dir> — 预安装 VirtIO 驱动
+ * ================================================================ */
+
+static int cmd_inject_driver(int argc, char *argv[]) {
+#ifdef _WIN32
+    const char *driver_dir = (argc >= 3 && argv[2][0] != '\0')
+                             ? argv[2] : "drivers";
+    printf("Injecting VirtIO drivers from: %s\n", driver_dir);
+
+    driver_result_t results[3];
+    int rc = driver_inject_virtio(driver_dir, results);
+
+    /* Print per-driver result */
+    for (int i = 0; i < 3; i++) {
+        driver_result_t *r = &results[i];
+        if (r->installed) {
+            printf("  %-10s  [ALREADY INSTALLED]\n", r->name);
+        } else if (r->just_installed) {
+            printf("  %-10s  [INSTALLED NOW]\n", r->name);
+        } else {
+            printf("  %-10s  [FAILED] %s\n", r->name, r->error);
+        }
+    }
+
+    if (rc == 0) {
+        printf("\nAll VirtIO drivers are now in the driver store.\n");
+        printf("When the VM boots on Tencent Cloud KVM, Windows will load them automatically.\n");
+        return 0;
+    } else {
+        printf("\nWARNING: Some drivers failed to install.\n");
+        printf("On target KVM, a missing viostor driver WILL cause 0x7B BSOD.\n");
+        return 1;
+    }
+#else
+    (void)argc; (void)argv;
+    printf("Driver injection is only supported on Windows.\n");
+    return 1;
+#endif
+}
+
+/* ================================================================
+ * 子命令: check_drivers — 检查 VirtIO 驱动是否已安装
+ * ================================================================ */
+
+static int cmd_check_drivers(int argc, char *argv[]) {
+#ifdef _WIN32
+    const char *driver_dir = (argc >= 3 && argv[2][0] != '\0')
+                             ? argv[2] : "drivers";
+    printf("Checking VirtIO drivers in: %s\n", driver_dir);
+
+    driver_result_t results[3];
+    int rc = driver_check_virtio(driver_dir, results);
+
+    int installed = 0;
+    for (int i = 0; i < 3; i++) {
+        driver_result_t *r = &results[i];
+        printf("  %-10s  ", r->name);
+        if (r->installed) {
+            printf("[INSTALLED]\n");
+            installed++;
+        } else {
+            printf("[MISSING] %s\n", r->error[0] ? r->error : "driver not in store");
+        }
+    }
+
+    printf("\nStatus: %d/3 drivers installed\n", installed);
+
+    if (rc != 0) {
+        printf("Remedy: run  client.exe inject_driver %s\n", driver_dir);
+    }
+
+    return rc;
+#else
+    (void)argc; (void)argv;
+    printf("Driver check is only supported on Windows.\n");
+    return 1;
+#endif
+}
+
+/* ================================================================
+ * 子命令: checkenv [driver_dir] — 全面系统环境检查
+ * ================================================================ */
+
+static int cmd_checkenv(int argc, char *argv[]) {
+    const char *driver_dir = (argc >= 3 && argv[2][0] != '\0')
+                             ? argv[2] : "drivers";
+
+    syschk_result_t result;
+    int rc = system_check_run(&result, driver_dir);
+    system_check_print(&result);
+    return rc;
 }
 
 /* ================================================================
@@ -2615,6 +2711,9 @@ int main(int argc, char *argv[]) {
         printf("        --acked             Show only confirmed (ack=1) blocks\n");
         printf("  %s dryrun [config.json]       Simulate full migration locally\n", argv[0]);
         printf("  %s incsync <ip:port> [config.json]  Single-pass incremental sync\n", argv[0]);
+        printf("  %s checkenv [driver_dir]      Full system environment check\n", argv[0]);
+        printf("  %s check_drivers [dir]        Check VirtIO driver install status\n", argv[0]);
+        printf("  %s inject_driver [dir]        Pre-install VirtIO drivers for KVM\n", argv[0]);
         printf("  %s --help                     Show this help\n", argv[0]);
         return 0;
     }
@@ -2637,6 +2736,9 @@ int main(int argc, char *argv[]) {
         printf("  %s dryrun [config.json]\n", argv[0]);
         printf("  %s incsync <ip:port> [config.json]\n", argv[0]);
         printf("  %s blockinfo [flags] [db] [devno] [offset]\n", argv[0]);
+        printf("  %s checkenv [driver_dir]\n", argv[0]);
+        printf("  %s check_drivers [dir]\n", argv[0]);
+        printf("  %s inject_driver [dir]\n", argv[0]);
         printf("\nConfig file defaults to user.json\n");
         return 0;
     }
@@ -2683,6 +2785,15 @@ int main(int argc, char *argv[]) {
     }
     if (strcmp(argv[1], "incsync") == 0) {
         return cmd_incsync(argc, argv);
+    }
+    if (strcmp(argv[1], "inject_driver") == 0) {
+        return cmd_inject_driver(argc, argv);
+    }
+    if (strcmp(argv[1], "check_drivers") == 0) {
+        return cmd_check_drivers(argc, argv);
+    }
+    if (strcmp(argv[1], "checkenv") == 0) {
+        return cmd_checkenv(argc, argv);
     }
 
     /* ————— 迁移模式 ————— */
