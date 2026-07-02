@@ -63,7 +63,7 @@ EvtIoWrite(WDFQUEUE Queue, WDFREQUEST Request, size_t Length)
 		WDF_REQUEST_SEND_OPTION_SEND_AND_FORGET);
 
 	if (!WdfRequestSend(Request, WdfDeviceGetIoTarget(device), &options)) {
-		WdfRequestComplete(Request, STATUS_UNSUCCESSFUL);
+		WdfRequestComplete(Request, WdfRequestGetStatus(Request));
 	}
 }
 
@@ -81,7 +81,24 @@ EvtIoDefault(WDFQUEUE Queue, WDFREQUEST Request)
 	if (!WdfRequestSend(Request,
 		WdfDeviceGetIoTarget(WdfIoQueueGetDevice(Queue)),
 		&options)) {
-		WdfRequestComplete(Request, STATUS_UNSUCCESSFUL);
+		WdfRequestComplete(Request, WdfRequestGetStatus(Request));
+	}
+}
+
+/* ---------------------------------------------------------------
+ * Queue stop handler. Requeue on Suspend, cancel on Purge so PnP
+ * stop/remove can proceed.
+ * --------------------------------------------------------------- */
+
+VOID
+EvtIoStop(WDFQUEUE Queue, WDFREQUEST Request, ULONG ActionFlags)
+{
+	UNREFERENCED_PARAMETER(Queue);
+
+	if (ActionFlags & WdfRequestStopActionPurge) {
+		WdfRequestComplete(Request, STATUS_CANCELLED);
+	} else {
+		WdfRequestStopAcknowledge(Request, TRUE);
 	}
 }
 

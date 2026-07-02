@@ -24,20 +24,21 @@ go2cloud_flt.DriverFiles = 12
 [SourceDisksFiles]
 go2cloud_flt.sys = 1,,
 
-; ---- Class-level UpperFilter registration ----
-; Adds "go2cloud_flt" to the UpperFilters multi-string value
-; under HKLM\...\Control\Class\{DiskDrive-GUID}
-
-[ClassInstall32.NT]
-AddReg = ClassInstall_AddReg
-
-[ClassInstall_AddReg]
-HKR,,UpperFilters,0x00010008,go2cloud_flt
+; ClassInstall32.NT is deliberately omitted — {4D36E967} (DiskDrive)
+; is a system-predefined class and ClassInstall32 may be ignored
+; by PnP.  To add go2cloud_flt as an UpperFilter, set the
+; registry manually:
+;   reg add "HKLM\SYSTEM\CurrentControlSet\Control\Class\{4D36E967-E325-11CE-BFC1-08002BE10318}"
+;       /v UpperFilters /t REG_MULTI_SZ /d go2cloud_flt
+; or use pnputil /add-driver.
 
 ; ---- Driver install ----
 
 [DefaultInstall.NT]
 CopyFiles = go2cloud_flt.DriverFiles
+
+[DefaultInstall.NT.Services]
+AddService = go2cloud_flt, 0x00000002, go2cloud_flt.Service
 
 [DefaultUninstall.NT]
 DelFiles = go2cloud_flt.DriverFiles
@@ -57,7 +58,7 @@ AddService = go2cloud_flt, 0x00000002, go2cloud_flt.Service
 [go2cloud_flt.Service]
 DisplayName    = %ServiceDesc%
 ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
-StartType      = 3               ; SERVICE_DEMAND_START
+StartType      = 1               ; SERVICE_SYSTEM_START
 ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
 ServiceBinary  = %12%\go2cloud_flt.sys
 LoadOrderGroup = PnP Filter

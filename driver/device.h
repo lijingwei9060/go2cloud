@@ -17,7 +17,10 @@ typedef struct _FILTER_DEVICE_CONTEXT {
     ULONG   BitmapSize;      /* bitmap byte count */
 
     PUCHAR  Bitmap;          /* NonPagedPool — dirty-block bitmap */
+    BOOLEAN Removing;        /* set by EvtDeviceReleaseHardware */
     WDFSPINLOCK BitmapLock;  /* protects Bitmap + DirtyCount + stats */
+    WDFWORKITEM InitWorkItem;/* handle for EvtDiskInitWorkItem, atomically exchanged */
+    BOOLEAN BootDisk;        /* TRUE if this device is the system/boot disk */
 
     ULONG   DirtyCount;      /* current dirty block count */
 
@@ -39,8 +42,6 @@ WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(CONTROL_DEVICE_CONTEXT, ControlGetContext);
 /* Function declarations */
 NTSTATUS BitmapInit(FILTER_DEVICE_CONTEXT *ctx, ULONG disk_number, LONGLONG total_bytes);
 VOID BitmapFree(FILTER_DEVICE_CONTEXT *ctx);
-VOID FilterRegisterDisk(CONTROL_DEVICE_CONTEXT *ctrl_ctx, ULONG disk_number, FILTER_DEVICE_CONTEXT *ctx);
-VOID FilterUnregisterDisk(CONTROL_DEVICE_CONTEXT *ctrl_ctx, ULONG disk_number);
 FILTER_DEVICE_CONTEXT *FilterLookupDisk(CONTROL_DEVICE_CONTEXT *ctrl_ctx, ULONG disk_number);
 VOID FilterLookupRelease(FILTER_DEVICE_CONTEXT *ctx);
 
@@ -55,6 +56,7 @@ VOID EvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request,
                         ULONG IoControlCode);
 VOID EvtIoWrite(WDFQUEUE Queue, WDFREQUEST Request, size_t Length);
 VOID EvtIoDefault(WDFQUEUE Queue, WDFREQUEST Request);
+VOID EvtIoStop(WDFQUEUE Queue, WDFREQUEST Request, ULONG ActionFlags);
 
 /* IOCTL handlers */
 NTSTATUS IoctlGetBitmap(CONTROL_DEVICE_CONTEXT *ctrl_ctx, WDFREQUEST Request);

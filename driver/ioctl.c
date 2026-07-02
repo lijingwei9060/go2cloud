@@ -13,9 +13,10 @@
  *   Input:  ULONG DiskNumber
  *   Output: GO2CLOUD_BITMAP (variable-length)
  *
- * Two-phase locking: first capture BitmapSize under BitmapLock, then release
- * and retrieve the output buffer via WDF calls outside the lock.  Re-acquire
- * for the metadata+bitmap snapshot so the data is consistent.
+ * Three-phase locking: capture BitmapSize under BitmapLock (Phase 1),
+ * retrieve output buffer via WDF outside lock (Phase 2), then capture
+ * metadata + copy bitmap payload inside the lock (Phase 3) so the
+ * bitmap cannot be freed by a concurrent ReleaseHardware mid-copy.
  */
 NTSTATUS IoctlGetBitmap(CONTROL_DEVICE_CONTEXT *ctrl_ctx, WDFREQUEST Request)
 {
@@ -55,20 +56,28 @@ NTSTATUS IoctlGetBitmap(CONTROL_DEVICE_CONTEXT *ctrl_ctx, WDFREQUEST Request)
 	if (!out_buf || out_size < needed)
 		return STATUS_BUFFER_TOO_SMALL;
 
-	/* Phase 3: re-acquire lock for a consistent snapshot */
+	/* Phase 3: capture metadata + bitmap inside the lock.
+	 * Holding BitmapLock across RtlCopyMemory protects ctx->Bitmap
+	 * from being freed by EvtDeviceReleaseHardware.  RtlCopyMemory
+	 * is non-paged and safe at DISPATCH_LEVEL (spinlock IRQL). */
 	ctx = FilterLookupDisk(ctrl_ctx, disk_number);
 	if (!ctx)
 		return STATUS_NOT_FOUND;
 
-	PGO2CLOUD_BITMAP out = (PGO2CLOUD_BITMAP)out_buf;
-	out->DiskNumber = ctx->DiskNumber;
-	out->TotalBytes = ctx->TotalBytes;
-	out->BlockSize = DCBT_BLOCK_SIZE;
-	out->TotalBlocks = ctx->TotalBlocks;
-	out->DirtyBlocks = ctx->DirtyCount;
-	out->BitmapSize = ctx->BitmapSize;
-	RtlCopyMemory(out->Bitmap, ctx->Bitmap, ctx->BitmapSize);
+	{
+		PGO2CLOUD_BITMAP out = (PGO2CLOUD_BITMAP)out_buf;
+		PUCHAR src = ctx->Bitmap;
+		ULONG src_size = ctx->BitmapSize;
 
+		out->DiskNumber = ctx->DiskNumber;
+		out->TotalBytes = ctx->TotalBytes;
+		out->BlockSize = DCBT_BLOCK_SIZE;
+		out->TotalBlocks = ctx->TotalBlocks;
+		out->DirtyBlocks = ctx->DirtyCount;
+		out->BitmapSize = src_size;
+
+		RtlCopyMemory(out->Bitmap, src, src_size);
+	}
 	FilterLookupRelease(ctx);
 
 	WdfRequestSetInformation(Request, needed);

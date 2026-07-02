@@ -45,7 +45,7 @@ if %ERRORLEVEL% neq 0 (
 )
 echo [OK] Link done
 
-echo [3/3] Signing...
+echo [3/5] Signing .sys...
 set SIGNSDK=%WINSDK%\bin\%WINSDKVER%\x64
 set CERTFILE=%~dp0go2cloud_test.pfx
 
@@ -65,13 +65,39 @@ if %ERRORLEVEL% neq 0 (
     echo   If testsigning is off, use: bcdedit /set testsigning on ^(reboot required^)
     goto :done
 )
-echo [OK] Signing done
+echo [OK] .sys signed
 
-echo [4/4] Installing test certificate to trusted stores...
-powershell -NoProfile -ExecutionPolicy Bypass -Command "Export-Certificate -Cert (Get-AuthenticodeSignature '%CD%\go2cloud_flt.sys').SignerCertificate -FilePath '%CD%\go2cloud_test.cer'" >nul 2>&1
-certutil -addstore -f Root go2cloud_test.cer >nul 2>&1
-certutil -addstore -f TrustedPublisher go2cloud_test.cer >nul 2>&1
+echo [4/5] Generating catalog...
+set INFCAT="%WINSDK%\bin\%WDKVER%\x86\inf2cat.exe"
+if not exist %INFCAT% set INFCAT="%WINSDK%\bin\%WDKVER%\x64\inf2cat.exe"
+if not exist %INFCAT% (
+    echo [WARN] inf2cat.exe not found — catalog skipped, use manual install
+    goto :cert_install
+)
+%INFCAT% /driver:%CD% /os:10_X64,10_NI_X64,10_GE_X64 /verbose
 if %ERRORLEVEL% neq 0 (
+    echo [WARN] Catalog generation failed
+    goto :cert_install
+)
+echo [OK] Catalog generated
+
+echo   Signing catalog...
+"%SIGNSDK%\signtool.exe" sign /v /fd sha256 /f "%CERTFILE%" /p go2cloud go2cloud_flt.cat
+if %ERRORLEVEL% neq 0 (
+    echo [WARN] Catalog signing failed
+) else (
+    echo [OK] Catalog signed
+)
+
+:cert_install
+echo [5/5] Installing test certificate to trusted stores...
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Export-Certificate -Cert (Get-AuthenticodeSignature '%CD%\go2cloud_flt.sys').SignerCertificate -FilePath '%CD%\go2cloud_test.cer'" >nul 2>&1
+set CERTERR=0
+certutil -addstore -f Root go2cloud_test.cer >nul 2>&1
+if %ERRORLEVEL% neq 0 set CERTERR=1
+certutil -addstore -f TrustedPublisher go2cloud_test.cer >nul 2>&1
+if %ERRORLEVEL% neq 0 set CERTERR=1
+if %CERTERR% neq 0 (
     echo [WARN] Cert install failed ^(admin required^)^, driver built but may not load
     echo   Run as Administrator and re-run this script, OR manually:
     echo     certutil -addstore -f Root %~dp0go2cloud_test.cer
@@ -80,5 +106,13 @@ if %ERRORLEVEL% neq 0 (
     echo [OK] Cert installed to Root + TrustedPublisher
 )
 
+echo [OK] Cert installed
+
 :done
+echo Deploying to d:\migrate\cert...
+if not exist d:\migrate\cert mkdir d:\migrate\cert
+copy /Y go2cloud_flt.sys d:\migrate\cert\ >nul
+copy /Y go2cloud_flt.inf d:\migrate\cert\ >nul
+if exist go2cloud_flt.cat copy /Y go2cloud_flt.cat d:\migrate\cert\ >nul
 echo === go2cloud_flt.sys built ===
+echo   Install: pnputil /add-driver d:\migrate\cert\go2cloud_flt.inf /install ^(admin required^)
