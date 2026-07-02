@@ -35,6 +35,7 @@ typedef struct {
     uint64_t block_count;              /* 可传输块数 (按 1MB 计算) */
     int      writable;                 /* 是否可写 (源端仅读) */
     int      has_vss;                  /* 1 = 已创建 VSS 快照 */
+    int      part_index;               /* 分区在磁盘上的序号 (从 1 开始) */
 } volume_info_t;
 
 /* 卷列表 */

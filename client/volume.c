@@ -125,6 +125,7 @@ int volume_enumerate(volume_list_t *list) {
             vol->writable         = 0;
             vol->has_vss          = 0;
             vol->vss_path[0]      = '\0';
+            vol->part_index       = (int)(p + 1);
             snprintf(vol->name, sizeof(vol->name), "Disk%dPart%lu",
                      (int)devno, (unsigned long)(p + 1));
 

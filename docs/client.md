@@ -36,7 +36,8 @@ client.exe vss_query              # 查询所有现有快照
 client.exe vss_delete <guid>      # 删除指定快照
 client.exe vss_delete --all       # 删除所有快照
 client.exe dryrun [config.json]   # 本地模拟全量+增量迁移，无网络 I/O
-client.exe blockinfo [db] [devno] [offset]  # 查询块跟踪数据库
+client.exe incsync <ip:port> [config.json]  # 单轮增量同步（从 live disk 重读对比，仅发送变化块）
+client.exe blockinfo [flags] [db] [devno] [offset]  # 查询块跟踪数据库
 client.exe --help                 # 显示帮助
 ```
 
@@ -265,12 +266,13 @@ Disk   Size(GB) TotalBlocks      Name
 ### 3.10 blockinfo — 查询块跟踪数据库
 
 ```
-client.exe blockinfo [db_path]                      整体摘要（按磁盘分组统计）
-client.exe blockinfo [db_path] <devno>              列出指定磁盘所有块
-client.exe blockinfo [db_path] <devno> <offset>     查看单个块详情
+client.exe blockinfo [flags] [db_path]                      整体摘要（按磁盘分组统计）
+client.exe blockinfo [flags] [db_path] <devno>              列出指定磁盘所有块
+client.exe blockinfo [flags] [db_path] <devno> <offset>     查看单个块详情
 ```
 
-- `db_path` 默认 `tracker.db`，仅当第一个参数含 `.` 时识别为数据库路径
+- `flags`：`--pending`（仅显示 ack=0 块）、`--acked`（仅显示 ack=1 块），可选
+- `db_path`：默认 `tracker.db`，仅当第一个非 flag 参数含 `.` 时识别为数据库路径
 - `devno`：磁盘编号（与 `info` 子命令输出的 Disk 列对应）
 - `offset`：块在磁盘上的字节偏移量
 
@@ -360,6 +362,79 @@ dd if=/dev/sdb bs=1M skip=1 count=1 2>/dev/null | ./hash_block -
 
 要匹配数据库中某个块的 hash，需根据块的来源（全量或增量）使用对应的 seed 值。通常情况下全量同步使用 seed=0，产生的 hash 存储在 `T_BLOCK` 表中。
 
+### 3.12 incsync — 单轮增量同步
+
+```
+client.exe incsync <server_ip:port> [config.json]
+```
+
+单轮增量同步子命令。连接服务端后，从 **live disk**（PhysicalDrive）重读所有非跳过分区的全部块，与 SQLite 数据库中的哈希值逐一对比，仅发送发生变化的块。一轮读完即结束。适用于：
+
+- **重复执行多轮**：每执行一次即完成一轮完整扫描和变化传输，通过多次调用来逼近收敛
+- **分区级过滤**：通过 `SkipPartitions` 配置精确排除不需要同步的分区（如系统保留分区）
+- **独立增量同步**：不依赖全量传输前置步骤，可对已有的 `tracker.db` 直接执行增量
+
+**运行流程**：
+
+1. 解析 `server_ip:port` 和配置文件
+2. 枚举分区，应用 `SkipDisks` 和 `SkipPartitions` 过滤
+3. 连接服务端，发送 `ctlIncremental`
+4. 重置所有 `ack=1` → `ack=0`（触发从 live disk 重读验证）
+5. 逐分区逐块：读 live disk → hash → 对比 DB → 仅发送变化块
+6. 排空队列，发送 `ctlEndIncremental`，等待服务端确认
+7. 打印统计：扫描数、跳过数（未变化）、变化数、发送字节数
+
+**与迁移模式增量同步的对比**：
+
+| 方面 | 迁移模式 (TailSend=1) | incsync 子命令 |
+|------|----------------------|---------------|
+| 触发方式 | 全量传输完成后自动进入 | 手动独立执行 |
+| 收敛循环 | 多轮自动循环，最多 60 轮 | 单轮，重复执行多次 |
+| 分区过滤 | `SkipDisks`（磁盘级） | `SkipDisks` + `SkipPartitions`（分区级） |
+| 连接要求 | 同一连接持续到收敛结束 | 每轮重新连接 |
+| 适用场景 | 单次完整迁移 | 增量同步、选择性分区同步 |
+
+**配置**：
+
+使用 `user.json`，支持以下额外字段：
+
+```json
+{
+    "SkipPartitions": "0:2,0:3,1:1"
+}
+```
+
+- `SkipPartitions`：逗号分隔的 `devno:part_index` 对，跳过指定分区
+  - `"0:2,0:3"` — 跳过磁盘 0 的分区 2 和分区 3
+  - `"1:1"` — 跳过磁盘 1 的分区 1
+  - 留空字符串表示不跳过任何分区
+
+**输出示例**：
+
+```
+Partitions to sync:
+Idx  Disk     Part#      Name             Skip
+---- ---- -------- ---------------- ----
+0    0        1         C:               sync
+1    0        3         Disk0Part3       SKIP
+2    1        1         D:               sync
+3    1        2         Disk1Part2       SKIP
+
+[INFO ] incsync: scanning C: (devno=0 part=1) 51200 blocks...
+[INFO ] incsync: 10240 scanned, 15 changed, 10225 skipped
+[INFO ] incsync: scanning D: (devno=1 part=1) 102400 blocks...
+[INFO ] incsync: draining queue (3 pending)...
+
+========== IncSync Results ==========
+  Scanned:  153600 blocks
+  Skipped:  153582 (unchanged)
+  Changed:  18 blocks
+  Sent:     18874368 bytes (0.02 GB)
+======================================
+```
+
+**退出码**：0 成功，1 失败（无分区可同步、无法连接服务端等）。
+
 ---
 
 ## 4. 迁移模式
@@ -392,6 +467,7 @@ client.exe 192.168.1.100:3389 user.json        # 使用自定义配置
 | `TailSend` | int | 0 | 1=增量模式（Zstd level 1），0=全量模式（Zstd level 7） |
 | `HasDump` | int | 1 | 预留 |
 | `SkipDisks` | int[] | [] | 要跳过的磁盘编号列表 |
+| `SkipPartitions` | string | "" | 要跳过的分区，格式 `"devno:part,devno:part,..."`（incsync 用） |
 | `Disks` | map | {} | 手动指定磁盘路径（覆盖自动枚举） |
 | `DbPath` | string | "tracker.db" | SQLite 块跟踪数据库路径 |
 | `Log.Level` | int | 3 (INFO) | 日志级别 |
@@ -638,6 +714,8 @@ Go 控制端（go2tencentcloud）
 ├─ client.exe vss_delete --all  → 清理所有快照
 │
 ├─ client.exe dryrun [config]   → 本地模拟迁移（验证流水线 / 性能基准）
+│
+├─ client.exe incsync <ip:port> [config] → 单轮增量同步（live disk 对比，仅发变化块）
 │
 └─ client.exe blockinfo [db] ...→ 查询块跟踪数据库（调试 / 校验）
 ```

@@ -112,10 +112,18 @@ static const char *json_read_str(const char *json, const char *key,
 static const char *json_nav(const char *json, const char *parent) {
     char search[JSON_MAX_KEY + 8];
     snprintf(search, sizeof(search), "\"%s\"", parent);
-    const char *p = strstr(json, search);
-    if (!p) return NULL;
-    p = strchr(p + strlen(search), '{');
-    return p;
+    const char *p = json;
+    while ((p = strstr(p, search)) != NULL) {
+        /* 确保是完整 key 匹配，而非子串 (如 "Disks" 误匹配 "SkipDisks") */
+        if (p == json || (*(p - 1) < 'a' || *(p - 1) > 'z')
+                      && (*(p - 1) < 'A' || *(p - 1) > 'Z')
+                      && *(p - 1) != '_') {
+            p = strchr(p + strlen(search), '{');
+            return p;
+        }
+        p++;
+    }
+    return NULL;
 }
 
 static char *read_file_all(const char *path) {
@@ -1847,6 +1855,404 @@ static int cmd_dryrun(int argc, char *argv[]) {
 }
 
 /* ================================================================
+ * 子命令: incsync — 单轮增量同步 (可反复调用)
+ *
+ *   client.exe incsync <ip:port> [config.json]
+ *
+ * 与 TailSend=1 内嵌增量循环不同, incsync 是独立的一次性命令:
+ *   1. 连接服务端, 发送 ctlIncremental
+ *   2. 重置 ack=1 → ack=0, 从 live disk 重读所有块
+ *   3. hash 与 DB 中的旧值对比, 仅发送变化块
+ *   4. 发送 ctlEndIncremental, 等待 SERVER_DONE
+ *   5. 打印变化块统计, 退出
+ *
+ * 多轮增量: 反复运行此命令即可。
+ *
+ * 配置新增字段:
+ *   "SkipPartitions": "devno:part,..."  跳过指定分区 (part 从 1 开始)
+ *   例: "0:2,0:3,1:1" → 跳过 disk0 分区2/3 和 disk1 分区1
+ * ================================================================ */
+
+/* 检查分区是否在跳过列表中。
+ * skip_str 格式: "devno:part,devno:part,..."
+ * 如 "0:2,0:3" 表示跳过 disk0 part2 和 part3。 */
+static int partition_is_skipped(const char *skip_str, int devno, int part_index) {
+    if (!skip_str || !skip_str[0]) return 0;
+
+    char target[32];
+    snprintf(target, sizeof(target), "%d:%d", devno, part_index);
+
+    const char *p = skip_str;
+    while (*p) {
+        /* 跳过空白和逗号 */
+        while (*p == ' ' || *p == ',' || *p == '\t') p++;
+        if (!*p) break;
+
+        const char *start = p;
+        while (*p && *p != ',' && *p != ' ' && *p != '\t') p++;
+
+        size_t len = (size_t)(p - start);
+        if (len > 0 && len < sizeof(target)
+            && strncmp(target, start, len) == 0
+            && target[len] == '\0') {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int cmd_incsync(int argc, char *argv[]) {
+    if (argc < 3) {
+        printf("Usage: %s incsync <ip:port> [config.json]\n", argv[0]);
+        return 1;
+    }
+
+    /* 解析 ip:port */
+    const char *target = argv[2];
+    char server_ip[64] = {0};
+    uint16_t server_port = 3389;
+    {
+        const char *colon = strchr(target, ':');
+        if (colon) {
+            size_t ip_len = MIN((size_t)(colon - target), sizeof(server_ip) - 1);
+            memcpy(server_ip, target, ip_len);
+            server_port = (uint16_t)atoi(colon + 1);
+        } else {
+            strncpy(server_ip, target, sizeof(server_ip) - 1);
+        }
+    }
+
+    /* 读取配置文件 (可选) */
+    const char *config_path = "user.json";
+    if (argc >= 4) config_path = argv[3];
+
+    char *config_json = read_file_all(config_path);
+    int tail_send = 0;
+    char db_path[512] = "tracker.db";
+    char skip_part_str[512] = {0};
+    int skip_disks[16];
+    int skip_count = 0;
+
+    if (config_json) {
+        tail_send = json_read_int(config_json, "TailSend", 0);
+        json_read_str(config_json, "DbPath", db_path, sizeof(db_path));
+
+        /* 解析 SkipDisks */
+        const char *disks_section = json_nav(config_json, "Disks");
+        if (!disks_section) {
+            const char *sd = strstr(config_json, "\"SkipDisks\"");
+            if (sd) {
+                sd = strchr(sd, '[');
+                if (sd) {
+                    sd++;
+                    while (*sd && skip_count < 16) {
+                        /* 跳过空白和逗号; 遇到 ] 表示数组结束 */
+                        while (*sd == ' ' || *sd == ',') sd++;
+                        if (*sd == ']' || !*sd) break;
+                        if (*sd < '0' || *sd > '9') break;
+                        skip_disks[skip_count++] = atoi(sd);
+                        while (*sd >= '0' && *sd <= '9') sd++;
+                    }
+                }
+            }
+        }
+
+        /* 解析 SkipPartitions (与 Disks section 有无无关) */
+        {
+            char sp_buf[512];
+            if (json_read_str(config_json, "SkipPartitions", sp_buf, sizeof(sp_buf))) {
+                snprintf(skip_part_str, sizeof(skip_part_str), "%s", sp_buf);
+            }
+        }
+    }
+
+    /* 初始化日志 */
+    int log_level = LOG_LEVEL_INFO;
+    char log_path[256] = {0};
+    if (config_json) {
+        const char *log_section = json_nav(config_json, "Log");
+        if (log_section) {
+            log_level = json_read_int(log_section, "Level", LOG_LEVEL_INFO);
+            json_read_str(log_section, "Path", log_path, sizeof(log_path));
+        }
+    }
+    log_init(log_level, log_path[0] ? log_path : NULL);
+    LOG_INFO("incsync: starting single-pass incremental sync → %s:%d",
+             server_ip, (int)server_port);
+
+    /* 枚举分区 */
+    volume_list_t vol_list;
+    if (volume_enumerate(&vol_list) != 0) {
+        LOG_ERROR("incsync: no volumes found");
+        free(config_json);
+        return 1;
+    }
+    LOG_INFO("incsync: %d partitions enumerated", vol_list.count);
+
+    /* 打印并过滤分区 */
+    printf("Partitions to sync:\n");
+    printf("%-4s %-8s %-10s %-16s %s\n", "Idx", "Disk", "Part#", "Name", "Skip");
+    printf("---- ---- -------- ---------------- ----\n");
+
+    int active_count = 0;
+    int active_idx[64];
+    for (int i = 0; i < vol_list.count; i++) {
+        volume_info_t *v = &vol_list.volumes[i];
+        int skipped = 0;
+
+        /* 磁盘级别跳过 */
+        for (int j = 0; j < skip_count; j++) {
+            if (skip_disks[j] == v->devno) { skipped = 1; break; }
+        }
+        /* 分区级别跳过 */
+        if (!skipped && partition_is_skipped(skip_part_str, v->devno, v->part_index)) {
+            skipped = 1;
+        }
+
+        printf("%-4d %-8d %-10d %-16s %s\n",
+               i, v->devno, v->part_index, v->name,
+               skipped ? "SKIP" : "sync");
+
+        if (!skipped) {
+            active_idx[active_count++] = i;
+        }
+    }
+
+    if (active_count == 0) {
+        LOG_ERROR("incsync: all partitions skipped, nothing to sync");
+        free(config_json);
+        return 1;
+    }
+
+    /* 初始化 Winsock */
+#ifdef _WIN32
+    WSADATA wsa_data;
+    WSAStartup(MAKEWORD(2, 2), &wsa_data);
+#endif
+
+    /* 打开 SQLite */
+    sqlite_db_t *db = sqlite_open(db_path);
+    if (!db) {
+        LOG_ERROR("incsync: cannot open DB %s", db_path);
+        free(config_json);
+        return 1;
+    }
+    char remote_id[256];
+    snprintf(remote_id, sizeof(remote_id), "%s:%d", server_ip, (int)server_port);
+    sqlite_set_remote_id(db, remote_id);
+
+    /* 分配缓冲区 */
+    uint8_t *data_buf = malloc((size_t)BLOCK_SIZE);
+    if (!data_buf) {
+        LOG_ERROR("incsync: out of memory");
+        sqlite_close(db);
+        free(config_json);
+        return 1;
+    }
+
+    /* 创建迁移上下文 (复用 flush_one / process_ack 等函数) */
+    migrate_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    strncpy(ctx.server_ip, server_ip, sizeof(ctx.server_ip) - 1);
+    ctx.server_port = server_port;
+    ctx.tail_send   = 0;   /* process_ack 中将服务端 ACK 直接标记 ack=1 */
+    ctx.dry_run     = 0;
+    ctx.db          = db;
+    ctx.zstd_level  = tail_send ? 1 : 7;
+
+    queue_init(&ctx.queue);
+    msgpack_writer_init(&ctx.mp_writer);
+
+    /* 连接服务端 (单连接) */
+    if (pool_init(&ctx.pool, ctx.server_ip, ctx.server_port) < 0) {
+        LOG_ERROR("incsync: cannot connect to %s:%d", server_ip, (int)server_port);
+        sqlite_close(db);
+        free(data_buf);
+        free(config_json);
+        return 1;
+    }
+
+    /* 发送 ctlIncremental 通知服务端进入增量模式 */
+    {
+        pool_conn_t *c = pool_acquire(&ctx.pool);
+        if (c) {
+            wire_send_control(c->fd, CTL_INCREMENTAL, CTL_INCREMENTAL_LEN);
+            pool_release(&ctx.pool, c);
+            LOG_INFO("incsync: sent ctlIncremental");
+        }
+    }
+
+    /* ================================================================
+     * 重置 ack=1 → ack=0, 触发所有块从 live disk 重读验证
+     * ================================================================ */
+    int total_acked = sqlite_count_blocks(db, -1, 1);
+    if (total_acked > 0) {
+        int reset = sqlite_reset_acked(db, remote_id);
+        LOG_INFO("incsync: reset %d blocks (ack=1 → ack=0) for re-verification",
+                 reset);
+    }
+
+    /* ================================================================
+     * 核心: 逐分区逐块扫描, hash 对比, 仅发送变化块
+     * ================================================================ */
+    int64_t now_ms = (int64_t)timer_now_ms();
+    uint64_t blocks_scanned = 0;
+    uint64_t blocks_changed = 0;
+    uint64_t blocks_skipped  = 0;
+    uint64_t bytes_sent      = 0;
+
+    for (int ai = 0; ai < active_count; ai++) {
+        volume_info_t *vol = &vol_list.volumes[active_idx[ai]];
+        LOG_INFO("incsync: scanning %s (devno=%d part=%d) %llu blocks...",
+                 vol->name, vol->devno, vol->part_index,
+                 (unsigned long long)vol->block_count);
+
+        block_reader_t *reader = block_reader_open(vol->disk_path);
+        if (!reader) {
+            LOG_ERROR("incsync: cannot open %s, skipping", vol->disk_path);
+            continue;
+        }
+
+        uint64_t part_base = vol->partition_offset;
+        uint64_t n_blocks  = vol->block_count;
+
+        for (uint64_t blk = 0; blk < n_blocks; blk++) {
+            uint64_t disk_offset = part_base + blk * BLOCK_SIZE;
+            uint32_t data_len = 0;
+
+            if (block_reader_read(reader, disk_offset, data_buf,
+                                  (uint32_t)BLOCK_SIZE, &data_len) != 0) {
+                LOG_WARN("incsync: read error devno=%d offset=%llu",
+                         vol->devno, (unsigned long long)disk_offset);
+                continue;
+            }
+            if (data_len == 0) continue;
+
+            blocks_scanned++;
+            uint64_t new_hash = hash_block(data_buf, data_len,
+                                           disk_offset & 0xFFFFFFFF);
+
+            /* 对比 DB 中的 hash */
+            uint64_t stored_hash = 0;
+            int lookup_rc = sqlite_block_lookup(db, vol->devno,
+                                                (int64_t)disk_offset,
+                                                &stored_hash);
+            if (lookup_rc == 0 && stored_hash == new_hash) {
+                /* 块未变化 */
+                blocks_skipped++;
+                sqlite_update_last_sent(db, vol->devno,
+                                        (int64_t)disk_offset, now_ms);
+                sqlite_block_mark_acked(db, vol->devno,
+                                        (int64_t)disk_offset);
+            } else {
+                /* 块变化或新增 → MsgPack 编码 → 入队 */
+                if (msgpack_encode_block(&ctx.mp_writer, vol->devno,
+                                         (int64_t)disk_offset,
+                                         data_buf, data_len) != 0) {
+                    LOG_WARN("incsync: encode failed devno=%d offset=%llu",
+                             vol->devno, (unsigned long long)disk_offset);
+                    continue;
+                }
+
+                int rc;
+                while ((rc = queue_push(&ctx.queue, vol->devno,
+                                        (int64_t)disk_offset, new_hash,
+                                        ctx.mp_writer.buf,
+                                        ctx.mp_writer.written)) != 0) {
+                    while (flush_one(&ctx) > 0) { }
+                    process_ack(&ctx);
+#ifdef _WIN32
+                    Sleep(50);
+#else
+                    usleep(50000);
+#endif
+                }
+
+                sqlite_block_upsert(db, vol->devno, (int64_t)disk_offset,
+                                    (int32_t)data_len, new_hash, 0);
+                blocks_changed++;
+                bytes_sent += data_len;
+            }
+
+            /* 周期性 flush + ACK 处理 (每 1024 块) */
+            if ((blocks_scanned & 1023) == 0) {
+                while (flush_one(&ctx) > 0) { }
+                process_ack(&ctx);
+                LOG_INFO("incsync: %llu scanned, %llu changed, %llu skipped",
+                         (unsigned long long)blocks_scanned,
+                         (unsigned long long)blocks_changed,
+                         (unsigned long long)blocks_skipped);
+            }
+        }
+
+        block_reader_close(reader);
+    }
+
+    /* ================================================================
+     * 排空队列 + 收尾 ACK
+     * ================================================================ */
+    LOG_INFO("incsync: draining queue (%d pending)...", queue_count(&ctx.queue));
+    for (int drain = 0; drain < 300; drain++) {
+        while (flush_one(&ctx) > 0) { }
+        process_ack(&ctx);
+        if (queue_count(&ctx.queue) == 0) break;
+#ifdef _WIN32
+        Sleep(100);
+#else
+        usleep(100000);
+#endif
+    }
+
+    /* 发送 ctlEndIncremental + 等待 SERVER_DONE */
+    {
+        pool_conn_t *c = pool_acquire(&ctx.pool);
+        if (c) {
+            wire_send_control(c->fd, CTL_END_INCREMENTAL, CTL_END_INCREMENTAL_LEN);
+            pool_release(&ctx.pool, c);
+            LOG_INFO("incsync: sent ctlEndIncremental, waiting for SERVER_DONE...");
+        }
+    }
+
+    for (int w = 0; w < 300; w++) {
+        process_ack(&ctx);
+#ifdef _WIN32
+        Sleep(100);
+#else
+        usleep(100000);
+#endif
+    }
+
+    /* ================================================================
+     * 结果输出
+     * ================================================================ */
+    printf("\n");
+    printf("========== IncSync Results ==========\n");
+    printf("  Scanned:  %llu blocks\n",   (unsigned long long)blocks_scanned);
+    printf("  Skipped:  %llu (unchanged)\n", (unsigned long long)blocks_skipped);
+    printf("  Changed:  %llu blocks\n",   (unsigned long long)blocks_changed);
+    printf("  Sent:     %llu bytes (%.2f GB)\n",
+           (unsigned long long)bytes_sent,
+           (double)bytes_sent / (1024.0 * 1024.0 * 1024.0));
+    printf("======================================\n");
+
+    LOG_INFO("incsync: complete — %llu scanned, %llu changed, %llu bytes sent",
+             (unsigned long long)blocks_scanned,
+             (unsigned long long)blocks_changed,
+             (unsigned long long)bytes_sent);
+
+    /* 清理 */
+    queue_destroy(&ctx.queue);
+    msgpack_writer_free(&ctx.mp_writer);
+    pool_destroy(&ctx.pool);
+    sqlite_close(db);
+    free(data_buf);
+    free(config_json);
+    log_close();
+
+    return 0;
+}
+
+/* ================================================================
  * 入口
  * ================================================================ */
 
@@ -1871,6 +2277,7 @@ int main(int argc, char *argv[]) {
         printf("        --pending           Show only pending (ack=0) blocks\n");
         printf("        --acked             Show only confirmed (ack=1) blocks\n");
         printf("  %s dryrun [config.json]       Simulate full migration locally\n", argv[0]);
+        printf("  %s incsync <ip:port> [config.json]  Single-pass incremental sync\n", argv[0]);
         printf("  %s --help                     Show this help\n", argv[0]);
         return 0;
     }
@@ -1891,6 +2298,7 @@ int main(int argc, char *argv[]) {
         printf("  %s vss_delete <guid>\n", argv[0]);
         printf("  %s vss_delete --all\n", argv[0]);
         printf("  %s dryrun [config.json]\n", argv[0]);
+        printf("  %s incsync <ip:port> [config.json]\n", argv[0]);
         printf("  %s blockinfo [flags] [db] [devno] [offset]\n", argv[0]);
         printf("\nConfig file defaults to user.json\n");
         return 0;
@@ -1935,6 +2343,9 @@ int main(int argc, char *argv[]) {
     }
     if (strcmp(argv[1], "dryrun") == 0) {
         return cmd_dryrun(argc, argv);
+    }
+    if (strcmp(argv[1], "incsync") == 0) {
+        return cmd_incsync(argc, argv);
     }
 
     /* ————— 迁移模式 ————— */
