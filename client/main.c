@@ -49,6 +49,7 @@
 #include "vss.h"
 #include "driver_inject.h"
 #include "syschk.h"
+#include "dcbt.h"
 #include "../include/protocol.h"
 
 #include <stdio.h>
@@ -182,6 +183,7 @@ typedef struct {
     uint64_t      rate_bytes_sent;    /* 当前速率窗口内已发送字节数 */
     uint64_t      rate_window_start;  /* 当前速率窗口起始时间 (ms) */
     uint64_t      total_blocks;       /* 所有分区待发送块总数 */
+    dcbt_t        dcbt;               /* DCBT 驱动接口 */
 } migrate_ctx_t;
 
 /* ================================================================
@@ -1177,6 +1179,57 @@ static int do_incremental_round(migrate_ctx_t *ctx,
     /* Fisher-Yates 随机打乱, 避免顺序 I/O 导致磁盘缓存命中偏差 */
     shuffle_blocks(devnos, offsets, hashes, last_sents, count);
 
+    /*
+     * DCBT: 如果内核驱动可用, 查询每个磁盘的脏块位图。
+     * 只处理位图中标记为脏的块, 跳过未变化的块 (标记为 verified/acked)。
+     */
+#define DCBT_BM_STATIC 16
+    struct {
+        int             devno;
+        unsigned char  *bitmap;
+        ULONG           bm_size;
+        int             active;
+    } dcbt_cache[DCBT_BM_STATIC];
+    int dcbt_used = 0;
+    memset(dcbt_cache, 0, sizeof(dcbt_cache));
+
+    if (dcbt_is_available(&ctx->dcbt)) {
+        for (int i = 0; i < count && g_running; i++) {
+            int32_t devno = devnos[i];
+            int slot = -1;
+            /* 检查此 devno 是否已有缓存 */
+            for (int j = 0; j < DCBT_BM_STATIC; j++) {
+                if (dcbt_cache[j].active && dcbt_cache[j].devno == devno) {
+                    slot = j;
+                    break;
+                }
+                if (slot < 0 && !dcbt_cache[j].active) slot = j;
+            }
+            if (slot < 0) break;  /* 缓存槽已满 — 回退到全量检查 */
+
+            if (!dcbt_cache[slot].active) {
+                ULONG bm_size = 0;
+                if (dcbt_query_bitmap_size(&ctx->dcbt, (ULONG)devno,
+                                           NULL, &bm_size) != 0)
+                    continue;
+                unsigned char *bm = (unsigned char *)malloc(bm_size);
+                if (!bm) continue;
+                if (dcbt_get_bitmap(&ctx->dcbt, (ULONG)devno,
+                                    bm, bm_size, NULL) != 0) {
+                    free(bm);
+                    continue;
+                }
+                dcbt_cache[slot].devno   = devno;
+                dcbt_cache[slot].bitmap  = bm;
+                dcbt_cache[slot].bm_size = bm_size;
+                dcbt_cache[slot].active  = 1;
+                dcbt_used = 1;
+                LOG_DEBUG("dcbt: disk %d bitmap loaded (%lu bytes)",
+                          devno, (unsigned long)bm_size);
+            }
+        }
+    }
+
     int64_t now_ms = (int64_t)timer_now_ms();
     int requeued = 0;
 
@@ -1189,6 +1242,30 @@ static int do_incremental_round(migrate_ctx_t *ctx,
         /* 121 秒冷却期: 同一块不频繁重读 */
         if (last_sent > 0 && (now_ms - last_sent) < RETRANSMIT_MIN_INTERVAL_SEC * 1000) {
             continue;
+        }
+
+        /* DCBT 过滤: 如果块有脏位图但未被标记为脏, 跳过 I/O */
+        if (dcbt_used) {
+            int found_bm = 0;
+            int dirty = 0;
+            for (int j = 0; j < DCBT_BM_STATIC; j++) {
+                if (dcbt_cache[j].active && dcbt_cache[j].devno == devno) {
+                    found_bm = 1;
+                    ULONG bi = (ULONG)(disk_offset / DCBT_BLOCK_SIZE);
+                    if (bi < dcbt_cache[j].bm_size * 8)
+                        dirty = dcbt_is_block_dirty(dcbt_cache[j].bitmap, bi);
+                    break;
+                }
+            }
+            if (found_bm && !dirty) {
+                if (current_version > 0)
+                    sqlite_block_mark_verified(db, devno, (int64_t)disk_offset,
+                                               current_version);
+                else
+                    sqlite_block_mark_acked(db, devno, (int64_t)disk_offset);
+                sqlite_update_last_sent(db, devno, (int64_t)disk_offset, now_ms);
+                continue;
+            }
         }
 
         /* 背压: 队列深度过大或内存不足时暂停, 剩余块留待下一轮 */
@@ -1289,6 +1366,16 @@ static int do_incremental_round(migrate_ctx_t *ctx,
         LOG_INFO("incremental round: %d blocks re-sent (%d total unacked)",
                  requeued, count);
     }
+
+    /* DCBT cleanup: 释放位图缓冲区; 如果本轮有重发数据, 清除驱动中的位图 */
+    for (int j = 0; j < DCBT_BM_STATIC; j++) {
+        if (dcbt_cache[j].active) {
+            if (requeued > 0)
+                dcbt_clear_bitmap(&ctx->dcbt, (ULONG)dcbt_cache[j].devno);
+            free(dcbt_cache[j].bitmap);
+        }
+    }
+
     return requeued;
 }
 
@@ -1702,6 +1789,13 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
             pool_release(&ctx->pool, c);
             LOG_INFO("sent ctlIncremental");
         }
+
+        /* 尝试打开 DCBT 驱动 — 用于增量轮中跳过未变化块 */
+        dcbt_open(&ctx->dcbt);
+        if (dcbt_is_available(&ctx->dcbt))
+            LOG_INFO("dcbt: driver loaded, using dirty-block bitmap filter");
+        else
+            LOG_INFO("dcbt: driver not available, falling back to full hash check");
     }
 
     /* ================================================================
@@ -2055,6 +2149,9 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
             }
         }
     }
+
+    /* 关闭 DCBT 驱动接口 */
+    dcbt_close(&ctx->dcbt);
 
     LOG_INFO("migration complete: %llu blocks, %llu bytes",
              (unsigned long long)sent_blocks, (unsigned long long)total_bytes);

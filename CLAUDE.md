@@ -10,7 +10,7 @@
 
 :: Build client
 call "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvarsx86_amd64.bat"
-cl /c /O2 /utf-8 client\main.c client\log.c client\hash.c client\msgpack.c client\wire.c client\queue.c client\pool.c client\timer.c client\sqlite.c client\volume.c client\block_io.c /Iinclude /Id:\vcpkg\installed\x64-windows\include
+cl /c /O2 /utf-8 client\main.c client\log.c client\hash.c client\msgpack.c client\wire.c client\queue.c client\pool.c client\timer.c client\sqlite.c client\volume.c client\block_io.c client\driver_inject.c client\syschk.c client\dcbt.c /Iinclude /Id:\vcpkg\installed\x64-windows\include
 cl /c /O2 /utf-8 /Tpclient\vss.c /Iinclude /Id:\vcpkg\installed\x64-windows\include
 link /OUT:client.exe *.obj /LIBPATH:d:\vcpkg\installed\x64-windows\lib zstd.lib sqlite3.lib ole32.lib vssapi.lib ws2_32.lib
 
@@ -30,17 +30,29 @@ vcpkg root: `d:\vcpkg`; triplet: `x64-windows`.
 
 ```
 go2cloud/
-├── include/protocol.h        — Shared protocol constants (client + server)
+├── include/
+│   ├── protocol.h            — Shared protocol constants (client + server)
+│   └── dcbt_ioctl.h          — DCBT IOCTL definitions (kernel + user shared)
+├── driver/                   — DCBT kernel filter driver (WDK)
+│   ├── driver.c              — DriverEntry, AddDevice, PnP callbacks
+│   ├── dispatch.c            — IRP dispatch (WRITE track, IOCTL route)
+│   ├── ioctl.c               — IOCTL handlers (GET/CLEAR_BITMAP, GET_STATS, etc.)
+│   ├── bitmap.c              — Dirty-block bitmap operations (NonPagedPool)
+│   ├── bitmap.h              — Bitmap macros (1 MB per block)
+│   ├── device.h              — Device extension structs, function declarations
+│   ├── go2cloud_flt.inf      — Driver install INF (DiskDrive class UpperFilter)
+│   └── build_driver.bat     — WDK build + test-sign script
 ├── client/                   — Source-side block transfer (Windows + Linux)
 │   ├── main.c                — Entry, config parsing, migration loop, subcommands
 │   ├── volume.c/.h           — Disk enumeration (PhysicalDriveN on Win, /dev/sdX on Linux)
 │   ├── block_io.c/.h         — Block-level disk read (Win32 CreateFile, Linux open/pread64)
 │   ├── vss.c/.h              — VSS snapshot management (Windows-only, COM)
-│   ├── driver_inject.c/.h    — VirtIO driver pre-install for KVM migration (Windows-only, Setup API)
-│   ├── syschk.c/.h           — Pre-migration system environment check (admin, VSS, disks, drivers)
+│   ├── driver_inject.c/.h    — VirtIO driver pre-install (devcon.exe, Windows-only)
+│   ├── syschk.c/.h           — Pre-migration system environment check
+│   ├── dcbt.c/.h             — User-mode DCBT driver interface (IOCTL client)
 │   ├── hash.c/.h             — Custom 64-bit xxHash-like hash
 │   ├── msgpack.c/.h          — MsgPack encoder (fixmap(3) block messages)
-│   ├── wire.c/.h             — 4-layer wire protocol: TCP 4B BE len → "abc" magic → Zstd → MsgPack
+│   ├── wire.c/.h             — 4-layer wire protocol: TCP 4B BE len → "abc" → Zstd → MsgPack
 │   ├── queue.c/.h            — Thread-safe ring buffer send queue (256 entries)
 │   ├── pool.c/.h             — Socket connection pool (7 concurrent TCP conns)
 │   ├── timer.c/.h            — Timer manager (retransmit/reconnect/incremental/action)
@@ -60,8 +72,11 @@ go2cloud/
 │   ├── protocol.md           — Wire protocol spec
 │   ├── receiver.md           — Receiver usage manual
 │   ├── driver_inject.md      — VirtIO driver injection guide
-│   └── system_check.md       — Pre-migration check reference
-└── Makefile                  — Cross-platform build (GCC / MSVC targets)
+│   ├── system_check.md       — Pre-migration check reference
+│   └── dcbt-design.md        — DCBT 2.0.0 design & implementation plan
+├── Makefile                  — Cross-platform build (GCC / MSVC targets)
+├── build_all.bat             — MSVC build (client + server)
+└── build_quick.bat           — MSVC build (client only, deploys to d:\migrate)
 ```
 
 ## Key Architecture Decisions
@@ -73,6 +88,7 @@ go2cloud/
 - **Fisher-Yates shuffle**: Randomizes unacked block processing order each incremental round (avoids disk cache bias).
 - **121s cooldown**: Minimum interval before re-reading the same block's hash from live disk (`RETRANSMIT_MIN_INTERVAL_SEC`).
 - **Convergence control**: 3 exit conditions — perfect (unacked==0), stable (3 zero-change rounds), timeout (60 rounds max).
+- **DCBT (Driver Change Block Tracking)**: Kernel filter driver (KMDF) on DiskDrive class intercepts writes, maintains a per-disk 1 MB granularity dirty bitmap. User mode queries via IOCTL, skipping hash-check for unwritten blocks during incremental sync. Falls back to full hash comparison if driver not loaded.
 
 ## Subcommands
 

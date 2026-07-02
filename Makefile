@@ -35,7 +35,7 @@ SERVER_SRC = server/main.c server/log.c server/session.c \
 CLIENT_SRC = client/main.c client/log.c client/hash.c client/msgpack.c \
              client/wire.c client/queue.c client/pool.c client/timer.c \
              client/sqlite.c client/volume.c client/block_io.c client/vss.c \
-             client/driver_inject.c client/syschk.c
+             client/driver_inject.c client/syschk.c client/dcbt.c
 
 # 目标和依赖
 SERVER_OBJ = $(SERVER_SRC:.c=.o)
@@ -87,13 +87,13 @@ client_msvc:
 	   client\main.c client\log.c client\hash.c client\msgpack.c \
 	   client\wire.c client\queue.c client\pool.c client\timer.c \
 	   client\sqlite.c client\volume.c client\block_io.c \
-	   client\driver_inject.c client\syschk.c \
+	   client\driver_inject.c client\syschk.c client\dcbt.c \
 	   /Iinclude /Id:\vcpkg\installed\x64-windows\include
 	cl /c /O2 /utf-8 /Tpclient\vss.c \
 	   /Iinclude /Id:\vcpkg\installed\x64-windows\include
 	link /OUT:client.exe main.obj log.obj hash.obj msgpack.obj wire.obj \
 	   queue.obj pool.obj timer.obj sqlite.obj volume.obj block_io.obj \
-	   driver_inject.obj syschk.obj vss.obj \
+	   driver_inject.obj syschk.obj dcbt.obj vss.obj \
 	   /LIBPATH:d:\vcpkg\installed\x64-windows\lib \
 	   zstd.lib sqlite3.lib ole32.lib vssapi.lib ws2_32.lib
 

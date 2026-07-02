@@ -1,0 +1,73 @@
+;
+; go2cloud_flt.inf — KMDF upper filter driver for DiskDrive class
+;
+; Installs as UpperFilter on {4D36E967-E325-11CE-BFC1-08002BE10318}
+; Intercepts write IRPs for DCBT dirty-block tracking.
+;
+
+[Version]
+Signature   = "$Windows NT$"
+Class       = DiskDrive
+ClassGuid   = {4D36E967-E325-11CE-BFC1-08002BE10318}
+Provider    = %Mfg%
+DriverVer   = 02/01/2025,2.0.0.0
+CatalogFile = go2cloud_flt.cat
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir  = 12              ; DIRID_DRIVERS
+go2cloud_flt.DriverFiles = 12
+
+[SourceDisksNames]
+1 = %DiskDescription%,,,""
+
+[SourceDisksFiles]
+go2cloud_flt.sys = 1,,
+
+; ---- Class-level UpperFilter registration ----
+; Adds "go2cloud_flt" to the UpperFilters multi-string value
+; under HKLM\...\Control\Class\{DiskDrive-GUID}
+
+[ClassInstall32.NT]
+AddReg = ClassInstall_AddReg
+
+[ClassInstall_AddReg]
+HKR,,UpperFilters,0x00010008,go2cloud_flt
+
+; ---- Driver install ----
+
+[DefaultInstall.NT]
+CopyFiles = go2cloud_flt.DriverFiles
+
+[DefaultUninstall.NT]
+DelFiles = go2cloud_flt.DriverFiles
+
+[go2cloud_flt.DriverFiles]
+go2cloud_flt.sys
+
+; ---- Driver service ----
+
+[go2cloud_flt.NT]
+CopyFiles = go2cloud_flt.DriverFiles
+AddReg   = go2cloud_flt.AddReg
+
+[go2cloud_flt.NT.Services]
+AddService = go2cloud_flt, 0x00000002, go2cloud_flt.Service
+
+[go2cloud_flt.Service]
+DisplayName    = %ServiceDesc%
+ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
+StartType      = 0               ; SERVICE_BOOT_START
+ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %12%\go2cloud_flt.sys
+LoadOrderGroup = PnP Filter
+
+[go2cloud_flt.AddReg]
+HKR,,SupportedFeatures,0x00010001,1
+
+; ---- Strings ----
+
+[Strings]
+Mfg             = "go2cloud Project"
+DiskDescription = "go2cloud DCBT Driver Installation Disk"
+ServiceDesc     = "go2cloud Change Block Tracking Filter"
