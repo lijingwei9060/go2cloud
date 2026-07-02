@@ -88,8 +88,9 @@ int main(int argc, char *argv[]) {
     if (argc < 2) {
         fprintf(stderr, "Usage: hash_block <file> [offset] [size] [seed]\n");
         fprintf(stderr, "       hash_block -               read from stdin\n");
-        fprintf(stderr, "  seed=0 matches client.exe full-sync hash\n");
-        fprintf(stderr, "  seed=(offset & 0xFFFFFFFF) matches client.exe incremental hash\n");
+        fprintf(stderr, "  seed defaults to 0\n");
+        fprintf(stderr, "  client.exe always uses seed=(offset & 0xFFFFFFFF)\n");
+        fprintf(stderr, "  To match T_BLOCK hash: seed = offset & 0xFFFFFFFF\n");
         return 1;
     }
 

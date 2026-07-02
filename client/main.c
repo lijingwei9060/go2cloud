@@ -176,6 +176,10 @@ typedef struct {
     int           zero_change_rounds;/* 连续无变化轮次数 */
     int           final_verify;      /* 1 = 正在执行最终验证轮 */
     int           dry_run;           /* 1 = dry-run mode, no network I/O */
+    int           rate_limit_mb;      /* 速率限制 (MB/s), 0 = 不限速 */
+    uint64_t      rate_bytes_sent;    /* 当前速率窗口内已发送字节数 */
+    uint64_t      rate_window_start;  /* 当前速率窗口起始时间 (ms) */
+    uint64_t      total_blocks;       /* 所有分区待发送块总数 */
 } migrate_ctx_t;
 
 /* ================================================================
@@ -904,6 +908,34 @@ static int flush_one(migrate_ctx_t *ctx) {
     conn->bytes_sent += entry.payload_len;
 
     pool_release(&ctx->pool, conn);
+
+    /* 速率控制: 超过 RateLimitMB 则短暂休眠 */
+    if (ctx->rate_limit_mb > 0) {
+        ctx->rate_bytes_sent += (uint64_t)entry.payload_len;
+        uint64_t now = timer_now_ms();
+        if (ctx->rate_window_start == 0) ctx->rate_window_start = now;
+
+        double bytes_per_ms = (double)ctx->rate_limit_mb * 1048576.0 / 1000.0;
+        if (bytes_per_ms > 0.0) {
+            uint64_t expected_ms = (uint64_t)((double)ctx->rate_bytes_sent
+                                              / bytes_per_ms);
+            uint64_t elapsed_ms = now - ctx->rate_window_start;
+            if (elapsed_ms < expected_ms) {
+                uint64_t sleep_ms = expected_ms - elapsed_ms;
+                if (sleep_ms > 200) sleep_ms = 200;
+#ifdef _WIN32
+                Sleep((DWORD)sleep_ms);
+#else
+                usleep((useconds_t)(sleep_ms * 1000));
+#endif
+            }
+        }
+        if (now - ctx->rate_window_start > 5000) {
+            ctx->rate_window_start = now;
+            ctx->rate_bytes_sent = 0;
+        }
+    }
+
     return 1;
 }
 
@@ -915,6 +947,8 @@ typedef struct {
     uint64_t        partition_offset;  /* 分区在磁盘上的绝对偏移 */
     uint64_t        block_count;       /* 分区实际块数 (非全盘) */
     int             is_vss;            /* 1 = 读取器打开 VSS 快照路径, 0 = PhysicalDrive */
+    char            name[16];          /* 分区名 (如 "C:") */
+    int             part_index;        /* 分区在磁盘上的索引 (1-based) */
 } reader_entry_t;
 
 /*
@@ -1426,6 +1460,8 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
             entry->block_count      = vol->block_count;
             entry->is_vss           = use_vss;
             entry->live_reader      = NULL;
+            snprintf(entry->name, sizeof(entry->name), "%s", vol->name);
+            entry->part_index       = vol->part_index;
 
             /* 打开 PhysicalDrive 读取器用于增量同步 (始终从 live disk 读取)。
              * VSS 快照是静态的时间点副本, 无法检测后续写入变化。 */
@@ -1484,13 +1520,29 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
     }
 
     /* ================================================================
+     * 分区清单
+     * ================================================================ */
+    printf("\nPartitions to sync:\n");
+    printf("%-4s %-8s %-10s %-16s %-12s %s\n",
+           "Idx", "Disk", "Part#", "Name", "Blocks", "Source");
+    printf("---- ---- -------- ---------------- ------------ --------\n");
+    for (int i = 0; i < reader_count; i++) {
+        reader_entry_t *e = &readers[i];
+        printf("%-4d %-8d %-10d %-16s %-12llu %s\n",
+               i, e->devno, e->part_index, e->name,
+               (unsigned long long)e->block_count,
+               e->is_vss ? "VSS" : "PhysicalDrive");
+    }
+    printf("\n");
+
+    /* ================================================================
      * 主传输循环
      * ================================================================ */
     LOG_INFO("starting block transfer: %d partitions", reader_count);
 
-    uint64_t total_blocks = 0;
     uint64_t sent_blocks  = 0;
     uint64_t total_bytes  = 0;
+    ctx->total_blocks = 0;
 
     for (int d = 0; d < reader_count && g_running; d++) {
         reader_entry_t *entry = &readers[d];
@@ -1519,7 +1571,7 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
         LOG_INFO("partition devno=%d base=%llu: %llu blocks to transfer",
                  entry->devno, (unsigned long long)part_base,
                  (unsigned long long)n_blocks);
-        total_blocks += n_blocks;
+        ctx->total_blocks += n_blocks;
 
         __try {
         for (uint64_t blk = 0; blk < n_blocks && g_running; blk++) {
@@ -1584,17 +1636,26 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
                 case TIMER_RECONNECT:
                     if (!ctx->dry_run) do_reconnect(ctx);
                     break;
-                case TIMER_ACTION:
+                case TIMER_ACTION: {
+                    int acked = ctx->db ? sqlite_count_blocks(ctx->db, -1, 1) : 0;
+                    double pct = ctx->total_blocks > 0
+                        ? (double)sent_blocks * 100.0 / (double)ctx->total_blocks : 0.0;
+                    printf("\rProgress: %llu/%llu blocks (%.1f%%) | acked=%d | queue=%d    ",
+                           (unsigned long long)sent_blocks,
+                           (unsigned long long)ctx->total_blocks,
+                           pct, acked, queue_count(&ctx->queue));
+                    fflush(stdout);
                     LOG_INFO("progress: partition %d/%d block %llu/%llu "
                              "sent=%llu/%llu queue=%d%s",
                              d + 1, reader_count,
                              (unsigned long long)blk,
                              (unsigned long long)n_blocks,
                              (unsigned long long)sent_blocks,
-                             (unsigned long long)total_blocks,
+                             (unsigned long long)ctx->total_blocks,
                              queue_count(&ctx->queue),
                              ctx->tail_send ? " [incremental]" : "");
                     break;
+                }
                 default:
                     break;
                 }
@@ -1767,14 +1828,19 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
                 case TIMER_RECONNECT:
                     if (!ctx->dry_run) do_reconnect(ctx);
                     break;
-                case TIMER_ACTION:
+                case TIMER_ACTION: {
+                    int unacked = sqlite_count_unacked(db, remote_id);
+                    int acked   = sqlite_count_blocks(db, -1, 1);
+                    printf("\rIncSync: round %d/%d | unacked=%d | acked=%d    ",
+                           ctx->inc_round, MAX_INCREMENTAL_ROUNDS, unacked, acked);
+                    fflush(stdout);
                     LOG_INFO("incremental: round %d/%d, %d unacked blocks, "
                              "queue=%d, stable=%d rounds",
                              ctx->inc_round, MAX_INCREMENTAL_ROUNDS,
-                             sqlite_count_unacked(db, remote_id),
-                             queue_count(&ctx->queue),
+                             unacked, queue_count(&ctx->queue),
                              ctx->zero_change_rounds);
                     break;
+                }
                 default:
                     break;
                 }
@@ -1824,6 +1890,7 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
 
     LOG_INFO("migration complete: %llu blocks, %llu bytes",
              (unsigned long long)sent_blocks, (unsigned long long)total_bytes);
+    printf("\n");
 
     /* ================================================================
      * VSS 清理
@@ -1857,6 +1924,7 @@ static int cmd_dryrun(int argc, char *argv[]) {
     int log_level    = LOG_LEVEL_INFO;
     int zstd_level   = ZSTD_COMPRESS_LEVEL_MAX;
     int tail_send    = 0;
+    int rate_limit_mb = 100;
     char log_path[256] = {0};
     char db_path[512]  = "tracker.db";
 
@@ -1873,6 +1941,7 @@ static int cmd_dryrun(int argc, char *argv[]) {
 
         tail_send  = json_read_int(config_json, "TailSend", 0);
         zstd_level = tail_send ? ZSTD_COMPRESS_LEVEL_MIN : ZSTD_COMPRESS_LEVEL_MAX;
+        rate_limit_mb = json_read_int(config_json, "RateLimitMB", 100);
 
         json_read_str(config_json, "DbPath", db_path, sizeof(db_path));
 
@@ -1881,6 +1950,9 @@ static int cmd_dryrun(int argc, char *argv[]) {
 
     ctx.zstd_level = zstd_level;
     ctx.tail_send  = tail_send;
+    ctx.rate_limit_mb     = rate_limit_mb;
+    ctx.rate_window_start = 0;
+    ctx.rate_bytes_sent   = 0;
     snprintf(ctx.db_path, sizeof(ctx.db_path), "%s", db_path);
 
     /* 初始化日志 */
@@ -2018,6 +2090,7 @@ static int cmd_incsync(int argc, char *argv[]) {
 
     char *config_json = read_file_all(config_path);
     int tail_send = 0;
+    int rate_limit_mb = 100;
     char db_path[512] = "tracker.db";
     char skip_part_str[512] = {0};
     int skip_disks[16];
@@ -2025,6 +2098,7 @@ static int cmd_incsync(int argc, char *argv[]) {
 
     if (config_json) {
         tail_send = json_read_int(config_json, "TailSend", 0);
+        rate_limit_mb = json_read_int(config_json, "RateLimitMB", 100);
         json_read_str(config_json, "DbPath", db_path, sizeof(db_path));
 
         /* 解析 SkipDisks */
@@ -2081,8 +2155,9 @@ static int cmd_incsync(int argc, char *argv[]) {
 
     /* 打印并过滤分区 */
     printf("Partitions to sync:\n");
-    printf("%-4s %-8s %-10s %-16s %s\n", "Idx", "Disk", "Part#", "Name", "Skip");
-    printf("---- ---- -------- ---------------- ----\n");
+    printf("%-4s %-8s %-10s %-16s %-8s %s\n",
+           "Idx", "Disk", "Part#", "Name", "Blocks", "Source");
+    printf("---- ---- -------- ---------------- -------- --------\n");
 
     int active_count = 0;
     int active_idx[64];
@@ -2099,9 +2174,11 @@ static int cmd_incsync(int argc, char *argv[]) {
             skipped = 1;
         }
 
-        printf("%-4d %-8d %-10d %-16s %s\n",
+        const char *source = skipped ? "SKIP" :
+            (v->name[0] && v->name[1] == ':') ? "VSS" : "PhysicalDrive";
+        printf("%-4d %-8d %-10d %-16s %-8llu %s\n",
                i, v->devno, v->part_index, v->name,
-               skipped ? "SKIP" : "sync");
+               (unsigned long long)v->block_count, source);
 
         if (!skipped) {
             active_idx[active_count++] = i;
@@ -2149,6 +2226,9 @@ static int cmd_incsync(int argc, char *argv[]) {
     ctx.dry_run     = 0;
     ctx.db          = db;
     ctx.zstd_level  = tail_send ? 1 : 7;
+    ctx.rate_limit_mb     = rate_limit_mb;
+    ctx.rate_window_start = 0;
+    ctx.rate_bytes_sent   = 0;
 
     queue_init(&ctx.queue);
     msgpack_writer_init(&ctx.mp_writer);
@@ -2173,6 +2253,57 @@ static int cmd_incsync(int argc, char *argv[]) {
     }
 
     /* ================================================================
+     * VSS 快照初始化
+     * ================================================================ */
+    vss_context_t *vss_ctx = vss_init();  /* VSS_CTX_BACKUP, 非持久快照 */
+    if (vss_ctx) LOG_INFO("incsync: VSS subsystem initialized");
+
+    /* 构建 VSS 卷列表 (仅分区有盘符的) */
+    const char *vss_volumes[VSS_MAX_VOLUMES + 1];
+    int vss_vol_indices[VSS_MAX_VOLUMES];
+    int vss_vol_count = 0;
+    for (int i = 0; i < vol_list.count && vss_vol_count < VSS_MAX_VOLUMES; i++) {
+        volume_info_t *v = &vol_list.volumes[i];
+        if (v->name[0] && v->name[1] == ':') {
+            vss_volumes[vss_vol_count] = v->name;
+            vss_vol_indices[vss_vol_count] = i;
+            vss_vol_count++;
+        }
+    }
+    vss_volumes[vss_vol_count] = NULL;
+
+    /* 创建快照并映射到 vol_list */
+    if (vss_ctx && vss_vol_count > 0) {
+        vss_snapshot_t snapshots[VSS_MAX_VOLUMES];
+        memset(snapshots, 0, sizeof(snapshots));
+        int snap_count = vss_create_snapshots(vss_ctx, vss_volumes, snapshots);
+        if (snap_count > 0) {
+            LOG_INFO("incsync: %d VSS snapshots created", snap_count);
+            for (int s = 0; s < snap_count; s++) {
+                if (!snapshots[s].valid) continue;
+                size_t orig_len = strlen(snapshots[s].original_volume);
+                if (orig_len > 0 && snapshots[s].original_volume[orig_len-1] == '\\')
+                    orig_len--;
+                for (int vi = 0; vi < vss_vol_count; vi++) {
+                    int vol_idx = vss_vol_indices[vi];
+                    volume_info_t *vol = &vol_list.volumes[vol_idx];
+                    if (strncmp(vol->name, snapshots[s].original_volume, orig_len) == 0
+                        && vol->name[orig_len] == '\0') {
+                        snprintf(vol->vss_path, sizeof(vol->vss_path), "%s",
+                                 snapshots[s].snapshot_path);
+                        vol->has_vss = 1;
+                        LOG_INFO("incsync VSS: %s -> %s", vol->name, vol->vss_path);
+                        break;
+                    }
+                }
+            }
+        } else {
+            LOG_WARN("incsync: VSS snapshot creation failed (%d), "
+                     "will use PhysicalDrive fallback", snap_count);
+        }
+    }
+
+    /* ================================================================
      * 获取下一版本号, 开始本轮增量同步
      * ================================================================ */
     int current_version = sqlite_get_next_version(db, remote_id);
@@ -2187,10 +2318,16 @@ static int cmd_incsync(int argc, char *argv[]) {
      * 核心: 逐分区逐块扫描, hash 对比, 仅发送变化块
      * ================================================================ */
     int64_t now_ms = (int64_t)timer_now_ms();
+    uint64_t total_blocks    = 0;
     uint64_t blocks_scanned = 0;
     uint64_t blocks_changed = 0;
     uint64_t blocks_skipped  = 0;
     uint64_t bytes_sent      = 0;
+
+    /* 计算总块数 (仅活跃分区) */
+    for (int ai = 0; ai < active_count; ai++) {
+        total_blocks += vol_list.volumes[active_idx[ai]].block_count;
+    }
 
     for (int ai = 0; ai < active_count; ai++) {
         volume_info_t *vol = &vol_list.volumes[active_idx[ai]];
@@ -2198,9 +2335,16 @@ static int cmd_incsync(int argc, char *argv[]) {
                  vol->name, vol->devno, vol->part_index,
                  (unsigned long long)vol->block_count);
 
-        block_reader_t *reader = block_reader_open(vol->disk_path);
+        const char *reader_path = vol->has_vss ? vol->vss_path : vol->disk_path;
+        block_reader_t *reader = block_reader_open(reader_path);
+        if (!reader && vol->has_vss) {
+            LOG_WARN("incsync: VSS reader open failed for %s, falling back to %s",
+                     vol->name, vol->disk_path);
+            reader = block_reader_open(vol->disk_path);
+            vol->has_vss = 0;
+        }
         if (!reader) {
-            LOG_ERROR("incsync: cannot open %s, skipping", vol->disk_path);
+            LOG_ERROR("incsync: cannot open %s, skipping", reader_path);
             continue;
         }
 
@@ -2210,8 +2354,10 @@ static int cmd_incsync(int argc, char *argv[]) {
         for (uint64_t blk = 0; blk < n_blocks; blk++) {
             uint64_t disk_offset = part_base + blk * BLOCK_SIZE;
             uint32_t data_len = 0;
+            uint64_t reader_offset = vol->has_vss
+                ? (blk * BLOCK_SIZE) : disk_offset;
 
-            if (block_reader_read(reader, disk_offset, data_buf,
+            if (block_reader_read(reader, reader_offset, data_buf,
                                   (uint32_t)BLOCK_SIZE, &data_len) != 0) {
                 LOG_WARN("incsync: read error devno=%d offset=%llu",
                          vol->devno, (unsigned long long)disk_offset);
@@ -2275,6 +2421,14 @@ static int cmd_incsync(int argc, char *argv[]) {
             if ((blocks_scanned & 1023) == 0) {
                 while (flush_one(&ctx) > 0) { }
                 process_ack(&ctx);
+                double pct = total_blocks > 0
+                    ? (double)blocks_scanned * 100.0 / (double)total_blocks : 0.0;
+                printf("\rIncSync: %llu/%llu blocks (%.1f%%) | changed=%llu | skipped=%llu    ",
+                       (unsigned long long)blocks_scanned,
+                       (unsigned long long)total_blocks, pct,
+                       (unsigned long long)blocks_changed,
+                       (unsigned long long)blocks_skipped);
+                fflush(stdout);
                 LOG_INFO("incsync: %llu scanned, %llu changed, %llu skipped",
                          (unsigned long long)blocks_scanned,
                          (unsigned long long)blocks_changed,
@@ -2283,6 +2437,14 @@ static int cmd_incsync(int argc, char *argv[]) {
         }
 
         block_reader_close(reader);
+    }
+
+    /* VSS 清理: 读取完毕即可释放快照 */
+    if (vss_ctx) {
+        vss_backup_complete(vss_ctx);
+        vss_cleanup(vss_ctx);
+        vss_ctx = NULL;
+        LOG_INFO("incsync: VSS snapshots released");
     }
 
     /* ================================================================
@@ -2481,6 +2643,7 @@ int main(int argc, char *argv[]) {
     int log_level    = LOG_LEVEL_INFO;
     int zstd_level   = ZSTD_COMPRESS_LEVEL_MAX;  /* full migration: level 7 */
     int tail_send    = 0;
+    int rate_limit_mb = 100;
     char log_path[256] = {0};
     char db_path[512]  = "tracker.db";
 
@@ -2499,6 +2662,7 @@ int main(int argc, char *argv[]) {
 
         /* 迁移参数 */
         tail_send  = json_read_int(config_json, "TailSend", 0);
+        rate_limit_mb = json_read_int(config_json, "RateLimitMB", 100);
         zstd_level = tail_send ? ZSTD_COMPRESS_LEVEL_MIN : ZSTD_COMPRESS_LEVEL_MAX;
 
         /* 数据库路径 */
@@ -2512,6 +2676,9 @@ int main(int argc, char *argv[]) {
 
     ctx.zstd_level = zstd_level;
     ctx.tail_send  = tail_send;
+    ctx.rate_limit_mb     = rate_limit_mb;
+    ctx.rate_window_start = 0;
+    ctx.rate_bytes_sent   = 0;
     snprintf(ctx.db_path, sizeof(ctx.db_path), "%s", db_path);
 
     /* 初始化日志 */

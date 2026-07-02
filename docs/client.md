@@ -378,12 +378,19 @@ dd if=/dev/sdb bs=1M skip=1 count=1 2>/dev/null | ./hash_block -
 
 **seed 说明**：
 
+client.exe 所有同步路径均使用 `seed = offset & 0xFFFFFFFF`：
+
 | 同步模式 | seed 值 | client.exe 中对应位置 |
 |---------|---------|---------------------|
-| 全量同步 | `0` | `send_block()` line 600 |
-| 增量同步 | `offset & 0xFFFFFFFF` | `do_incremental()` line 701/1003 |
+| 全量同步 | `offset & 0xFFFFFFFF` | `send_block()` |
+| 增量同步 | `offset & 0xFFFFFFFF` | `do_incremental_round()` / `cmd_incsync()` |
 
-要匹配数据库中某个块的 hash，需根据块的来源（全量或增量）使用对应的 seed 值。通常情况下全量同步使用 seed=0，产生的 hash 存储在 `T_BLOCK` 表中。
+要匹配 T_BLOCK 中存储的 hash，必须传入相同的 seed：
+
+```bash
+# 匹配 T_BLOCK 中 offset=1048576 的 hash (seed = 0x100000)
+./hash_block disk0.img 1048576 1048576 $((1048576 & 0xFFFFFFFF))
+```
 
 ### 3.12 incsync — 单轮增量同步
 
