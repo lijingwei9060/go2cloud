@@ -26,10 +26,11 @@ go2cloud_flt.sys = 1,,
 
 ; ClassInstall32.NT is deliberately omitted — {4D36E967} (DiskDrive)
 ; is a system-predefined class and ClassInstall32 may be ignored
-; by PnP.  To add go2cloud_flt as an UpperFilter, set the
-; registry manually:
-;   reg add "HKLM\SYSTEM\CurrentControlSet\Control\Class\{4D36E967-E325-11CE-BFC1-08002BE10318}"
-;       /v UpperFilters /t REG_MULTI_SZ /d go2cloud_flt
+; by PnP.  To add go2cloud_flt as an UpperFilter, append it to the
+; existing UpperFilters multi-string value:
+;   reg query "HKLM\SYSTEM\CurrentControlSet\Control\Class\{4D36E967-E325-11CE-BFC1-08002BE10318}"
+;       /v UpperFilters
+;   (then manually edit the multi-string to add "go2cloud_flt")
 ; or use pnputil /add-driver.
 
 ; ---- Driver install ----

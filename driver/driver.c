@@ -391,8 +391,6 @@ EvtDiskInitWorkItem(WDFWORKITEM WorkItem)
 	WDF_MEMORY_DESCRIPTOR out_desc;
 	NTSTATUS status = STATUS_UNSUCCESSFUL;
 
-	UNREFERENCED_PARAMETER(WorkItem);
-
 	__try {
 		WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&out_desc, &sd, sizeof(sd));
 		status = WdfIoTargetSendIoctlSynchronously(
