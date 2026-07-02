@@ -42,12 +42,19 @@ v2.0 增量:  查询位图 → 只读脏块 → 发送           (变化 500 MB 
 
 64 位 Windows 默认只加载有 EV 证书签名的驱动。开发/测试阶段需要开启测试签名：
 
+```powershell
+:: 在管理权限的 powershell 里面执行，确保返回 False（Secure Boot 必须关闭，否则 testsigning 不生效）
+Confirm-SecureBootUEFI
+```
+
 ```bat
 :: 以管理员身份运行 cmd
 bcdedit /set testsigning on
 ```
 
 **重启后生效**。桌面右下角出现 "Test Mode" 水印表示已开启。
+
+> **注意**：如果 `Confirm-SecureBootUEFI` 返回 `True`，必须进入 UEFI/BIOS 设置关闭 Secure Boot，否则即使 `testsigning on`，测试签名的驱动也无法加载。
 
 ### 3.2 构建驱动
 
@@ -59,18 +66,24 @@ build_driver.bat
 脚本自动完成：
 1. 编译 4 个 `.c` 源文件（`/kernel /O2`）
 2. 链接 `go2cloud_flt.sys`（KMDF 1.35）
-3. 创建自签测试证书（首次运行）
-4. 签名 `.sys` 文件
+3. 创建自签测试证书（首次运行）+ 签名 `.sys`
+4. 通过 `inf2cat` 生成 `.cat` 目录文件 + 签名
 5. 安装证书到受信根存储（需管理员权限）
+6. 部署 `.sys`、`.inf`、`.cat` 到 `d:\migrate\cert\`
+
+**注意**：步骤 4 需要 WDK 中的 `inf2cat.exe`（位于 `Windows Kits\10\bin\<version>\x86`）。
 
 ### 3.3 安装驱动
 
 ```bat
-:: 方式 1：INF 安装
-pnputil /add-driver go2cloud_flt.inf /install
+:: 推荐方式：pnputil 安装（需已签名的 .cat 目录文件）
+pnputil /add-driver d:\migrate\cert\go2cloud_flt.inf /install
 
-:: 方式 2：右键 go2cloud_flt.inf → 安装
+:: 备选方式：手动安装 PowerShell 脚本（绕过 pnputil，无需 .cat）
+powershell -ExecutionPolicy Bypass -File d:\migrate\cert\install_driver.ps1
 ```
+
+**`pnputil /add-driver` 要求驱动程序包包含经过签名的 `.cat` 目录文件。** `build_driver.bat` 会自动生成并签名 `.cat`。如果 `inf2cat.exe`（WDK 组件）不可用，请使用手动安装脚本 `install_driver.ps1`，该脚本会直接将驱动程序复制到 `System32\drivers`、创建服务并注册 UpperFilter。
 
 驱动注册为 DiskDrive 类的 UpperFilter，安装后**需要重启**才会生效。
 
@@ -361,8 +374,10 @@ bcdedit /set testsigning off
 :: === 一次性环境准备 ===
 bcdedit /set testsigning on                        # 开启测试签名
 :: 重启
-cd driver && build_driver.bat                      # 编译 + 签名
-pnputil /add-driver go2cloud_flt.inf /install      # 安装驱动
+cd driver && build_driver.bat                      # 编译 + 签名 + 部署到 d:\migrate\cert
+pnputil /add-driver d:\migrate\cert\go2cloud_flt.inf /install   # 安装驱动
+:: 如果 pnputil 失败，使用备选方案：
+:: powershell -ExecutionPolicy Bypass -File d:\migrate\cert\install_driver.ps1
 :: 重启
 
 :: === 验证驱动 ===

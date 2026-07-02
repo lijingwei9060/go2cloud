@@ -198,11 +198,10 @@ dcbt_clear(disk_number);                  // IOCTL_CLEAR_BITMAP (after successfu
 
 | 依赖 | 用途 | 获取方式 |
 |------|------|----------|
-| **WDK (Windows Driver Kit)** | 驱动编译 | Visual Studio Installer → WDK 组件 |
+| **WDK (Windows Driver Kit)** | 驱动编译 + inf2cat 工具 | Visual Studio Installer → WDK 组件 |
 | **Visual Studio 2022+** | 驱动开发和调试 | 已有 (VS 18) |
 | **EV Code Signing Certificate** | 生产签名 (Win10+ 64-bit 强制) | DigiCert / GlobalSign ~$300-500/年 |
 | **WinDbg** | 内核调试 | WDK 自带 |
-| **devcon.exe** | 驱动安装 | 已有 (`d:\migrate\devcon.exe`) |
 
 ### 开发阶段签名
 
@@ -212,23 +211,39 @@ dcbt_clear(disk_number);                  // IOCTL_CLEAR_BITMAP (after successfu
 :: 启用测试签名 (重启生效)
 bcdedit /set testsigning on
 
-:: 创建自签名证书
-makecert -r -pe -ss PrivateCertStore -n "CN=Go2CloudTest" go2cloud_test.cer
-
-:: 签名驱动
-signtool sign /v /s PrivateCertStore /n Go2CloudTest /t http://timestamp.digicert.com go2cloud_flt.sys
-
-:: 将证书导入受信任的根证书颁发机构
-certutil -addstore Root go2cloud_test.cer
+:: 创建自签名证书 + 签名 .sys + 生成并签名 .cat（build_driver.bat 一键完成）
+cd driver
+build_driver.bat
 ```
+
+`build_driver.bat` 自动完成：
+1. 编译 + 链接 `go2cloud_flt.sys`
+2. 用 PowerShell 创建自签名代码签名证书（`.pfx`）
+3. `signtool` 签名 `.sys`
+4. `inf2cat` 生成 `.cat` 目录文件 + `signtool` 签名 `.cat`
+5. `certutil` 安装证书到 Root + TrustedPublisher
+6. 部署所有文件到 `d:\migrate\cert\`
+
+**注意**：步骤 4 需要 WDK 中安装 `inf2cat.exe`（位于 `Windows Kits\10\bin\<version>\x86`）。如果不可用，构建脚本会跳过目录文件生成，用户可以改用 `install_driver.ps1` 手动安装驱动程序。
+
+#### 手动安装（当 `.cat` 不可用时）
+
+```powershell
+powershell -ExecutionPolicy Bypass -File d:\migrate\cert\install_driver.ps1
+```
+
+该脚本会复制 `.sys` 到 `System32\drivers`、创建内核服务并注册 DiskDrive UpperFilter——绕过完全需要经过签名的 `.cat` 文件的 `pnputil`。
 
 ### 生产部署
 
 ```bat
-:: 安装 EV 签名驱动
-devcon install go2cloud_flt.inf "Root\go2cloud_flt"
-:: 或者
+:: EV 证书签名（一次性）
+signtool sign /v /fd sha256 /f ev_cert.pfx /p <password> /tr http://timestamp.digicert.com /td sha256 go2cloud_flt.sys
+signtool sign /v /fd sha256 /f ev_cert.pfx /p <password> /tr http://timestamp.digicert.com /td sha256 go2cloud_flt.cat
+
+:: 安装
 pnputil /add-driver go2cloud_flt.inf /install
+:: 无需重启即可生效（PnP 管理器自动加载类级 UpperFilter）
 ```
 
 ---
@@ -238,15 +253,16 @@ pnputil /add-driver go2cloud_flt.inf /install
 ```
 go2cloud/
 ├── driver/                          ← 新增
-│   ├── go2cloud_flt.vcxproj        — MSBuild 项目文件
 │   ├── go2cloud_flt.inf            — 驱动安装 INF
+│   ├── go2cloud_flt.cat            — 生成：已签名的目录文件（用于 pnputil）
 │   ├── driver.c                    — DriverEntry + AddDevice + Unload
 │   ├── dispatch.c                  — IRP 分发 (MJ_CREATE, MJ_CLOSE, MJ_WRITE, MJ_DEVICE_CONTROL)
 │   ├── ioctl.c                     — IOCTL 处理器 (GET_BITMAP, CLEAR_BITMAP, GET_STATS)
 │   ├── bitmap.c                    — 位图操作 (Mark, Clear, Query, Init)
 │   ├── bitmap.h                    — 位图内部头文件
 │   ├── device.h                    — 设备扩展结构 + IOCTL 定义
-│   └── build_driver.bat           — 独立编译脚本
+│   ├── build_driver.bat           — 独立编译脚本（编译 + 签名 + .cat 生成 + 部署）
+│   └── go2cloud_test.pfx          — 生成：自签名测试证书
 │
 ├── client/
 │   ├── dcbt.c                      ← 新增: 用户态 DCBT 接口
@@ -256,8 +272,15 @@ go2cloud/
 ├── include/
 │   └── dcbt_ioctl.h                ← 新增: IOCTL 共享定义 (内核+用户态共用)
 │
+├── d:\migrate\cert\                 ← 部署目标（构建时自动复制）
+│   ├── go2cloud_flt.sys            — 已签名的驱动二进制文件
+│   ├── go2cloud_flt.inf            — 驱动安装 INF
+│   ├── go2cloud_flt.cat            — 已签名的目录文件（pnputil 需要）
+│   └── install_driver.ps1          — 备用手动安装脚本（绕过 pnputil）
+│
 └── docs/
-    └── dcbt-design.md              ← 本文档
+    ├── dcbt-design.md              ← 本文档
+    └── dcbt-user-guide.md          ← 使用手册
 ```
 
 ---
