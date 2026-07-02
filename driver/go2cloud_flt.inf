@@ -57,7 +57,7 @@ AddService = go2cloud_flt, 0x00000002, go2cloud_flt.Service
 [go2cloud_flt.Service]
 DisplayName    = %ServiceDesc%
 ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
-StartType      = 0               ; SERVICE_BOOT_START
+StartType      = 3               ; SERVICE_DEMAND_START
 ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
 ServiceBinary  = %12%\go2cloud_flt.sys
 LoadOrderGroup = PnP Filter

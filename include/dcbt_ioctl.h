@@ -49,7 +49,7 @@
 #define DCBT_DEVICE_NAME      L"\\Device\\go2cloud_flt"
 #define DCBT_SYMLINK_NAME     L"\\DosDevices\\go2cloud_flt"
 
-#pragma pack(push, 1)
+#pragma pack(push, 8)
 
 /* IOCTL_GO2CLOUD_GET_BITMAP: input = DiskNumber, output = GO2CLOUD_BITMAP */
 typedef struct _GO2CLOUD_BITMAP {

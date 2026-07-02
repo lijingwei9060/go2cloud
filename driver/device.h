@@ -42,6 +42,7 @@ VOID BitmapFree(FILTER_DEVICE_CONTEXT *ctx);
 VOID FilterRegisterDisk(CONTROL_DEVICE_CONTEXT *ctrl_ctx, ULONG disk_number, FILTER_DEVICE_CONTEXT *ctx);
 VOID FilterUnregisterDisk(CONTROL_DEVICE_CONTEXT *ctrl_ctx, ULONG disk_number);
 FILTER_DEVICE_CONTEXT *FilterLookupDisk(CONTROL_DEVICE_CONTEXT *ctrl_ctx, ULONG disk_number);
+VOID FilterLookupRelease(FILTER_DEVICE_CONTEXT *ctx);
 
 /* Bitmap operations */
 VOID BitmapMark(FILTER_DEVICE_CONTEXT *ctx, ULONG start_block, ULONG end_block);
@@ -49,10 +50,10 @@ VOID BitmapClear(FILTER_DEVICE_CONTEXT *ctx);
 ULONG BitmapCountDirty(FILTER_DEVICE_CONTEXT *ctx);
 
 /* Dispatch callbacks (defined in dispatch.c) */
-NTSTATUS EvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request,
-                            size_t OutputBufferLength, size_t InputBufferLength,
-                            ULONG IoControlCode);
-NTSTATUS EvtIoWrite(WDFQUEUE Queue, WDFREQUEST Request, size_t Length);
+VOID EvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request,
+                        size_t OutputBufferLength, size_t InputBufferLength,
+                        ULONG IoControlCode);
+VOID EvtIoWrite(WDFQUEUE Queue, WDFREQUEST Request, size_t Length);
 VOID EvtIoDefault(WDFQUEUE Queue, WDFREQUEST Request);
 
 /* IOCTL handlers */

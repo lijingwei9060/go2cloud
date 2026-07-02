@@ -7,6 +7,10 @@
  *
  * Control device (singleton):
  *   EvtIoDeviceControl — route IOCTLs to ioctl.c handlers
+ *
+ * All EvtIo* callbacks return VOID per the WDF contract.
+ * Requests are completed explicitly via WdfRequestComplete or implicitly
+ * by WdfRequestSend with SEND_AND_FORGET.
  */
 
 #include "device.h"
@@ -21,7 +25,7 @@ extern CONTROL_DEVICE_CONTEXT *g_CtrlCtx;
  * Filter device — write tracking
  * --------------------------------------------------------------- */
 
-NTSTATUS
+VOID
 EvtIoWrite(WDFQUEUE Queue, WDFREQUEST Request, size_t Length)
 {
 	UNREFERENCED_PARAMETER(Queue);
@@ -35,6 +39,8 @@ EvtIoWrite(WDFQUEUE Queue, WDFREQUEST Request, size_t Length)
 	WDFDEVICE device = WdfIoQueueGetDevice(Queue);
 	FILTER_DEVICE_CONTEXT *ctx = FilterGetContext(device);
 
+	WdfSpinLockAcquire(ctx->BitmapLock);
+
 	if (write_len > 0 && ctx->Bitmap) {
 		ULONG start = (ULONG)((ULONG64)offset / DCBT_BLOCK_SIZE);
 		ULONG end   = (ULONG)(((ULONG64)offset + write_len - 1) / DCBT_BLOCK_SIZE);
@@ -42,24 +48,23 @@ EvtIoWrite(WDFQUEUE Queue, WDFREQUEST Request, size_t Length)
 
 		KeQueryTickCount(&tick);
 
-		WdfSpinLockAcquire(ctx->BitmapLock);
-
 		BitmapMark(ctx, start, end);
 		ctx->TotalWrites++;
 		ctx->TotalBytesWritten += (ULONG64)write_len;
 		if (ctx->FirstWriteTick.QuadPart == 0)
 			ctx->FirstWriteTick = tick;
 		ctx->LastWriteTick = tick;
-
-		WdfSpinLockRelease(ctx->BitmapLock);
 	}
+
+	WdfSpinLockRelease(ctx->BitmapLock);
 
 	WDF_REQUEST_SEND_OPTIONS options;
 	WDF_REQUEST_SEND_OPTIONS_INIT(&options,
 		WDF_REQUEST_SEND_OPTION_SEND_AND_FORGET);
 
-	WdfRequestSend(Request, WdfDeviceGetIoTarget(device), &options);
-	return STATUS_SUCCESS;
+	if (!WdfRequestSend(Request, WdfDeviceGetIoTarget(device), &options)) {
+		WdfRequestComplete(Request, STATUS_UNSUCCESSFUL);
+	}
 }
 
 /* ---------------------------------------------------------------
@@ -73,16 +78,18 @@ EvtIoDefault(WDFQUEUE Queue, WDFREQUEST Request)
 	WDF_REQUEST_SEND_OPTIONS_INIT(&options,
 		WDF_REQUEST_SEND_OPTION_SEND_AND_FORGET);
 
-	WdfRequestSend(Request,
+	if (!WdfRequestSend(Request,
 		WdfDeviceGetIoTarget(WdfIoQueueGetDevice(Queue)),
-		&options);
+		&options)) {
+		WdfRequestComplete(Request, STATUS_UNSUCCESSFUL);
+	}
 }
 
 /* ---------------------------------------------------------------
  * Control device — IOCTL dispatch
  * --------------------------------------------------------------- */
 
-NTSTATUS
+VOID
 EvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request,
                    size_t OutputBufferLength, size_t InputBufferLength,
                    ULONG IoControlCode)
@@ -112,5 +119,4 @@ EvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request,
 	}
 
 	WdfRequestComplete(Request, status);
-	return STATUS_SUCCESS;
 }

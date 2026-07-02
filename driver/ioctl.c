@@ -12,45 +12,53 @@
  * IOCTL_GO2CLOUD_GET_BITMAP
  *   Input:  ULONG DiskNumber
  *   Output: GO2CLOUD_BITMAP (variable-length)
+ *
+ * Two-phase locking: first capture BitmapSize under BitmapLock, then release
+ * and retrieve the output buffer via WDF calls outside the lock.  Re-acquire
+ * for the metadata+bitmap snapshot so the data is consistent.
  */
 NTSTATUS IoctlGetBitmap(CONTROL_DEVICE_CONTEXT *ctrl_ctx, WDFREQUEST Request)
 {
 	NTSTATUS status;
 	FILTER_DEVICE_CONTEXT *ctx;
-	WDFMEMORY in_mem = WDF_NO_HANDLE, out_mem = WDF_NO_HANDLE;
+	WDFMEMORY out_mem = WDF_NO_HANDLE;
 	PVOID in_buf, out_buf;
 	size_t in_size, out_size, needed;
 
-	status = WdfRequestRetrieveInputMemory(Request, &in_mem);
-	if (!NT_SUCCESS(status))
-		return status;
-
-	in_buf = WdfMemoryGetBuffer(in_mem, &in_size);
-	if (!in_buf || in_size < sizeof(ULONG))
-		return STATUS_BUFFER_TOO_SMALL;
+	/* --- read DiskNumber from input (no lock needed) --- */
+	{
+		WDFMEMORY in_mem = WDF_NO_HANDLE;
+		status = WdfRequestRetrieveInputMemory(Request, &in_mem);
+		if (!NT_SUCCESS(status))
+			return status;
+		in_buf = WdfMemoryGetBuffer(in_mem, &in_size);
+		if (!in_buf || in_size < sizeof(ULONG))
+			return STATUS_BUFFER_TOO_SMALL;
+	}
 
 	ULONG disk_number = *(PULONG)in_buf;
 
+	/* Phase 1: capture bitmap size under lock, then release */
 	ctx = FilterLookupDisk(ctrl_ctx, disk_number);
 	if (!ctx)
 		return STATUS_NOT_FOUND;
 
-	WDFSPINLOCK lock = ctx->BitmapLock;
-	WdfSpinLockAcquire(lock);
-
 	needed = FIELD_OFFSET(GO2CLOUD_BITMAP, Bitmap) + ctx->BitmapSize;
+	FilterLookupRelease(ctx);
 
+	/* Phase 2: framework calls — no lock held */
 	status = WdfRequestRetrieveOutputMemory(Request, &out_mem);
-	if (!NT_SUCCESS(status)) {
-		WdfSpinLockRelease(lock);
+	if (!NT_SUCCESS(status))
 		return status;
-	}
 
 	out_buf = WdfMemoryGetBuffer(out_mem, &out_size);
-	if (!out_buf || out_size < needed) {
-		WdfSpinLockRelease(lock);
+	if (!out_buf || out_size < needed)
 		return STATUS_BUFFER_TOO_SMALL;
-	}
+
+	/* Phase 3: re-acquire lock for a consistent snapshot */
+	ctx = FilterLookupDisk(ctrl_ctx, disk_number);
+	if (!ctx)
+		return STATUS_NOT_FOUND;
 
 	PGO2CLOUD_BITMAP out = (PGO2CLOUD_BITMAP)out_buf;
 	out->DiskNumber = ctx->DiskNumber;
@@ -61,7 +69,7 @@ NTSTATUS IoctlGetBitmap(CONTROL_DEVICE_CONTEXT *ctrl_ctx, WDFREQUEST Request)
 	out->BitmapSize = ctx->BitmapSize;
 	RtlCopyMemory(out->Bitmap, ctx->Bitmap, ctx->BitmapSize);
 
-	WdfSpinLockRelease(lock);
+	FilterLookupRelease(ctx);
 
 	WdfRequestSetInformation(Request, needed);
 	return STATUS_SUCCESS;
@@ -93,9 +101,8 @@ NTSTATUS IoctlClearBitmap(CONTROL_DEVICE_CONTEXT *ctrl_ctx, WDFREQUEST Request)
 	if (!ctx)
 		return STATUS_NOT_FOUND;
 
-	WdfSpinLockAcquire(ctx->BitmapLock);
 	BitmapClear(ctx);
-	WdfSpinLockRelease(ctx->BitmapLock);
+	FilterLookupRelease(ctx);
 
 	return STATUS_SUCCESS;
 }
@@ -123,10 +130,13 @@ NTSTATUS IoctlGetStats(CONTROL_DEVICE_CONTEXT *ctrl_ctx, WDFREQUEST Request)
 
 	ULONG disk_number = *(PULONG)in_buf;
 
+	/* Phase 1: locked — validate disk and capture stats size req */
 	ctx = FilterLookupDisk(ctrl_ctx, disk_number);
 	if (!ctx)
 		return STATUS_NOT_FOUND;
+	FilterLookupRelease(ctx);
 
+	/* Phase 2: framework call — no lock */
 	status = WdfRequestRetrieveOutputMemory(Request, &out_mem);
 	if (!NT_SUCCESS(status))
 		return status;
@@ -135,15 +145,19 @@ NTSTATUS IoctlGetStats(CONTROL_DEVICE_CONTEXT *ctrl_ctx, WDFREQUEST Request)
 	if (!out_buf || out_size < sizeof(GO2CLOUD_STATS))
 		return STATUS_BUFFER_TOO_SMALL;
 
-	PGO2CLOUD_STATS out = (PGO2CLOUD_STATS)out_buf;
+	/* Phase 3: re-acquire for consistent snapshot */
+	ctx = FilterLookupDisk(ctrl_ctx, disk_number);
+	if (!ctx)
+		return STATUS_NOT_FOUND;
 
-	WdfSpinLockAcquire(ctx->BitmapLock);
+	PGO2CLOUD_STATS out = (PGO2CLOUD_STATS)out_buf;
 	out->DiskNumber = ctx->DiskNumber;
 	out->TotalWrites = ctx->TotalWrites;
 	out->TotalBytesWritten = ctx->TotalBytesWritten;
 	out->FirstWriteTick = ctx->FirstWriteTick.QuadPart;
 	out->LastWriteTick = ctx->LastWriteTick.QuadPart;
-	WdfSpinLockRelease(ctx->BitmapLock);
+
+	FilterLookupRelease(ctx);
 
 	WdfRequestSetInformation(Request, sizeof(GO2CLOUD_STATS));
 	return STATUS_SUCCESS;
@@ -200,10 +214,13 @@ NTSTATUS IoctlQueryBitmapSize(CONTROL_DEVICE_CONTEXT *ctrl_ctx, WDFREQUEST Reque
 
 	ULONG disk_number = *(PULONG)in_buf;
 
+	/* Phase 1: locked — validate disk presence */
 	ctx = FilterLookupDisk(ctrl_ctx, disk_number);
 	if (!ctx)
 		return STATUS_NOT_FOUND;
+	FilterLookupRelease(ctx);
 
+	/* Phase 2: framework call — no lock */
 	status = WdfRequestRetrieveOutputMemory(Request, &out_mem);
 	if (!NT_SUCCESS(status))
 		return status;
@@ -212,12 +229,17 @@ NTSTATUS IoctlQueryBitmapSize(CONTROL_DEVICE_CONTEXT *ctrl_ctx, WDFREQUEST Reque
 	if (!out_buf || out_size < sizeof(GO2CLOUD_BITMAP_SIZE))
 		return STATUS_BUFFER_TOO_SMALL;
 
+	/* Phase 3: re-acquire for consistent read */
+	ctx = FilterLookupDisk(ctrl_ctx, disk_number);
+	if (!ctx)
+		return STATUS_NOT_FOUND;
+
 	PGO2CLOUD_BITMAP_SIZE out = (PGO2CLOUD_BITMAP_SIZE)out_buf;
-	WdfSpinLockAcquire(ctx->BitmapLock);
 	out->DiskNumber = ctx->DiskNumber;
 	out->TotalBlocks = ctx->TotalBlocks;
 	out->BitmapSize = ctx->BitmapSize;
-	WdfSpinLockRelease(ctx->BitmapLock);
+
+	FilterLookupRelease(ctx);
 
 	WdfRequestSetInformation(Request, sizeof(GO2CLOUD_BITMAP_SIZE));
 	return STATUS_SUCCESS;

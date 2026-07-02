@@ -10,20 +10,26 @@
 #pragma warning(disable: 4054)  /* cast function pointer to PVOID */
 #pragma warning(disable: 4055)  /* cast function pointer to PVOID */
 
-/* Allocate and initialize the bitmap for a disk */
+/* Allocate and initialize the bitmap for a disk.
+ * IMPORTANT: ctx->Bitmap is set LAST so that EvtIoWrite (which checks
+ * Bitmap under BitmapLock to decide whether to track) never sees a
+ * non-NULL pointer before TotalBlocks / BitmapSize are valid. */
 NTSTATUS BitmapInit(FILTER_DEVICE_CONTEXT *ctx, ULONG disk_number, LONGLONG total_bytes)
 {
 	ULONG blocks = TOTAL_BLOCKS_FROM_DISK(total_bytes);
 	ULONG size = (blocks + 7) / 8;
+	PUCHAR bm;
 
 	if (blocks == 0 || size == 0)
 		return STATUS_INVALID_PARAMETER;
 
-	ctx->Bitmap = (PUCHAR)ExAllocatePool2(POOL_FLAG_NON_PAGED, size, 'T2CG');
-	if (!ctx->Bitmap)
+	bm = (PUCHAR)ExAllocatePool2(POOL_FLAG_NON_PAGED, size, 'T2CG');
+	if (!bm)
 		return STATUS_INSUFFICIENT_RESOURCES;
 
-	RtlZeroMemory(ctx->Bitmap, size);
+	RtlZeroMemory(bm, size);
+
+	/* Set all metadata before publishing the bitmap pointer */
 	ctx->DiskNumber = disk_number;
 	ctx->TotalBytes = total_bytes;
 	ctx->TotalBlocks = blocks;
@@ -33,6 +39,13 @@ NTSTATUS BitmapInit(FILTER_DEVICE_CONTEXT *ctx, ULONG disk_number, LONGLONG tota
 	ctx->TotalBytesWritten = 0;
 	ctx->FirstWriteTick.QuadPart = 0;
 	ctx->LastWriteTick.QuadPart = 0;
+
+	/* Full memory barrier: metadata stores MUST be globally visible
+	 * before Bitmap store, on all architectures including ARM64.
+	 * _WriteBarrier() is compiler-only; KeMemoryBarrier() also prevents
+	 * CPU store reordering on weakly-ordered architectures. */
+	KeMemoryBarrier();
+	ctx->Bitmap = bm;
 
 	return STATUS_SUCCESS;
 }
@@ -46,6 +59,12 @@ VOID BitmapFree(FILTER_DEVICE_CONTEXT *ctx)
 	}
 	ctx->BitmapSize = 0;
 	ctx->TotalBlocks = 0;
+	ctx->TotalBytes = 0;
+	ctx->DirtyCount = 0;
+	ctx->TotalWrites = 0;
+	ctx->TotalBytesWritten = 0;
+	ctx->FirstWriteTick.QuadPart = 0;
+	ctx->LastWriteTick.QuadPart = 0;
 }
 
 /* Mark blocks [start, end] as dirty. Caller holds BitmapLock. */

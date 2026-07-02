@@ -18,10 +18,67 @@
 #pragma warning(disable: 4055)
 
 CONTROL_DEVICE_CONTEXT *g_CtrlCtx = NULL;
+static ULONG g_BootDiskNumber = (ULONG)-1;
 
 /* Forward declarations for PnP callbacks */
 static NTSTATUS EvtDevicePrepareHardware(WDFDEVICE, WDFCMRESLIST, WDFCMRESLIST);
 static NTSTATUS EvtDeviceReleaseHardware(WDFDEVICE, WDFCMRESLIST);
+static VOID EvtDiskInitWorkItem(WDFWORKITEM);
+
+/* ---------------------------------------------------------------
+ * GetBootDiskNumber — read the boot disk rdisk(N) from registry
+ * --------------------------------------------------------------- */
+static ULONG GetBootDiskNumber(VOID)
+{
+	NTSTATUS status;
+	HANDLE hKey = NULL;
+	UNICODE_STRING keyName, valName;
+	OBJECT_ATTRIBUTES oa;
+	UCHAR buf[256];
+	PKEY_VALUE_PARTIAL_INFORMATION info;
+	ULONG resultLen;
+	ULONG diskNum = (ULONG)-1;
+
+	RtlInitUnicodeString(&keyName,
+		L"\\Registry\\Machine\\System\\CurrentControlSet\\Control");
+	InitializeObjectAttributes(&oa, &keyName,
+		OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+	status = ZwOpenKey(&hKey, KEY_READ, &oa);
+	if (!NT_SUCCESS(status))
+		return diskNum;
+
+	RtlInitUnicodeString(&valName, L"SystemBootDevice");
+	info = (PKEY_VALUE_PARTIAL_INFORMATION)buf;
+	status = ZwQueryValueKey(hKey, &valName, KeyValuePartialInformation,
+		buf, sizeof(buf), &resultLen);
+	ZwClose(hKey);
+	if (!NT_SUCCESS(status))
+		return diskNum;
+	if (info->Type != REG_SZ && info->Type != REG_EXPAND_SZ)
+		return diskNum;
+
+	/* Parse rdisk(N) from ARC path like multi(0)disk(0)rdisk(0)partition(1) */
+	PWCHAR data = (PWCHAR)info->Data;
+	PWCHAR end = data + info->DataLength / sizeof(WCHAR);
+	for (PWCHAR p = data; p + 6 <= end; p++) {
+		WCHAR c0 = p[0], c1 = p[1], c2 = p[2], c3 = p[3], c4 = p[4];
+		if ((c0 == L'r' || c0 == L'R') &&
+		    (c1 == L'd' || c1 == L'D') &&
+		    (c2 == L'i' || c2 == L'I') &&
+		    (c3 == L's' || c3 == L'S') &&
+		    (c4 == L'k' || c4 == L'K') &&
+		    p[5] == L'(') {
+			p += 6;
+			diskNum = 0;
+			while (p < end && *p >= L'0' && *p <= L'9') {
+				diskNum = diskNum * 10 + (*p - L'0');
+				p++;
+			}
+			break;
+		}
+	}
+	return diskNum;
+}
 
 /* ---------------------------------------------------------------
  * Global disk table helpers
@@ -48,6 +105,22 @@ VOID FilterUnregisterDisk(CONTROL_DEVICE_CONTEXT *ctrl_ctx, ULONG disk_number)
 	WdfSpinLockRelease(ctrl_ctx->TableLock);
 }
 
+/* FilterUnregisterDiskLocked — caller holds TableLock */
+static VOID FilterUnregisterDiskLocked(CONTROL_DEVICE_CONTEXT *ctrl_ctx,
+                                       ULONG disk_number)
+{
+	ctrl_ctx->DiskTable[disk_number] = NULL;
+}
+
+/*
+ * FilterLookupDisk — returns ctx with BitmapLock HELD on success.
+ * Caller MUST call FilterLookupRelease(ctx) to release BitmapLock.
+ * Returns NULL (no lock held) if the disk is not registered.
+ *
+ * Holding BitmapLock from inside TableLock closes the UAF window:
+ * EvtDeviceReleaseHardware acquires TableLock before BitmapLock,
+ * so it cannot free ctx while a lookup caller holds BitmapLock.
+ */
 FILTER_DEVICE_CONTEXT *FilterLookupDisk(CONTROL_DEVICE_CONTEXT *ctrl_ctx,
                                         ULONG disk_number)
 {
@@ -56,9 +129,16 @@ FILTER_DEVICE_CONTEXT *FilterLookupDisk(CONTROL_DEVICE_CONTEXT *ctrl_ctx,
 
 	WdfSpinLockAcquire(ctrl_ctx->TableLock);
 	FILTER_DEVICE_CONTEXT *ctx = ctrl_ctx->DiskTable[disk_number];
+	if (ctx)
+		WdfSpinLockAcquire(ctx->BitmapLock);
 	WdfSpinLockRelease(ctrl_ctx->TableLock);
 
 	return ctx;
+}
+
+VOID FilterLookupRelease(FILTER_DEVICE_CONTEXT *ctx)
+{
+	WdfSpinLockRelease(ctx->BitmapLock);
 }
 
 /* ---------------------------------------------------------------
@@ -87,11 +167,11 @@ static NTSTATUS CreateControlDevice(WDFDRIVER Driver)
 
 	status = WdfDeviceCreate(&dev_init, &obj_attrs, &ctrl_dev);
 	if (!NT_SUCCESS(status))
-		return status;
+		return status;  /* dev_init consumed by WdfDeviceCreate */
 
 	status = WdfDeviceCreateSymbolicLink(ctrl_dev, &sym_name);
 	if (!NT_SUCCESS(status))
-		return status;
+		goto cleanup;
 
 	WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&queue_cfg, WdfIoQueueDispatchSequential);
 	queue_cfg.EvtIoDeviceControl = EvtIoDeviceControl;
@@ -99,17 +179,21 @@ static NTSTATUS CreateControlDevice(WDFDRIVER Driver)
 	status = WdfIoQueueCreate(ctrl_dev, &queue_cfg,
 		WDF_NO_OBJECT_ATTRIBUTES, WDF_NO_HANDLE);
 	if (!NT_SUCCESS(status))
-		return status;
+		goto cleanup;
 
 	g_CtrlCtx = ControlGetContext(ctrl_dev);
 	RtlZeroMemory(g_CtrlCtx->DiskTable, sizeof(g_CtrlCtx->DiskTable));
 
 	status = WdfSpinLockCreate(WDF_NO_OBJECT_ATTRIBUTES, &g_CtrlCtx->TableLock);
 	if (!NT_SUCCESS(status))
-		return status;
+		goto cleanup;
 
 	WdfControlFinishInitializing(ctrl_dev);
 	return STATUS_SUCCESS;
+
+cleanup:
+	WdfObjectDelete(ctrl_dev);
+	return status;
 }
 
 /* ---------------------------------------------------------------
@@ -121,10 +205,22 @@ static VOID EvtUnload(WDFDRIVER Driver)
 	UNREFERENCED_PARAMETER(Driver);
 
 	if (g_CtrlCtx) {
+		/* Lock order: TableLock → BitmapLock, per the established
+		 * hierarchy.  Each disk has its own BitmapLock. */
 		for (ULONG i = 0; i < DCBT_MAX_DISKS; i++) {
-			if (g_CtrlCtx->DiskTable[i]) {
-				BitmapFree(g_CtrlCtx->DiskTable[i]);
+			FILTER_DEVICE_CONTEXT *ctx;
+
+			WdfSpinLockAcquire(g_CtrlCtx->TableLock);
+			ctx = g_CtrlCtx->DiskTable[i];
+			if (ctx) {
+				WdfSpinLockAcquire(ctx->BitmapLock);
 				g_CtrlCtx->DiskTable[i] = NULL;
+			}
+			WdfSpinLockRelease(g_CtrlCtx->TableLock);
+
+			if (ctx) {
+				BitmapFree(ctx);
+				WdfSpinLockRelease(ctx->BitmapLock);
 			}
 		}
 		if (g_CtrlCtx->TableLock)
@@ -183,7 +279,8 @@ EvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
 }
 
 /* ---------------------------------------------------------------
- * EvtDevicePrepareHardware — disk powered on; query number + size
+ * EvtDevicePrepareHardware — defer disk init to work item so
+ * IOCTL queries don't block or crash the PnP start path.
  * --------------------------------------------------------------- */
 
 static NTSTATUS
@@ -195,48 +292,92 @@ EvtDevicePrepareHardware(WDFDEVICE Device,
 	UNREFERENCED_PARAMETER(ResourcesTranslated);
 
 	FILTER_DEVICE_CONTEXT *ctx = FilterGetContext(Device);
-	WDFIOTARGET target = WdfDeviceGetIoTarget(Device);
-	WDF_MEMORY_DESCRIPTOR out_desc;
+
+	/* Already initialized on a previous D0 entry (e.g. sleep/resume).
+	 * NonPagedPool bitmap survives D3, so skip the work item. */
+	if (ctx->Bitmap)
+		return STATUS_SUCCESS;
+
+	WDF_WORKITEM_CONFIG workitem_cfg;
+	WDF_OBJECT_ATTRIBUTES workitem_attrs;
+	WDFWORKITEM workitem;
 	NTSTATUS status;
 
-	/* Query PhysicalDriveN number */
-	STORAGE_DEVICE_NUMBER sd = {0};
-	WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&out_desc, &sd, sizeof(sd));
+	WDF_OBJECT_ATTRIBUTES_INIT(&workitem_attrs);
+	workitem_attrs.ParentObject = Device;
 
-	status = WdfIoTargetSendIoctlSynchronously(
-		target, WDF_NO_HANDLE,
-		IOCTL_STORAGE_GET_DEVICE_NUMBER,
-		NULL, &out_desc, NULL, NULL);
-
+	WDF_WORKITEM_CONFIG_INIT(&workitem_cfg, EvtDiskInitWorkItem);
+	status = WdfWorkItemCreate(&workitem_cfg, &workitem_attrs, &workitem);
 	if (!NT_SUCCESS(status))
-		return STATUS_SUCCESS;
+		return status;
 
-	/* Query disk length */
-	GET_LENGTH_INFORMATION len_info = {0};
-	WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&out_desc, &len_info, sizeof(len_info));
-
-	status = WdfIoTargetSendIoctlSynchronously(
-		target, WDF_NO_HANDLE,
-		IOCTL_DISK_GET_LENGTH_INFO,
-		NULL, &out_desc, NULL, NULL);
-
-	if (!NT_SUCCESS(status))
-		return STATUS_SUCCESS;
-
-	/* Allocate bitmap and register */
-	ctx->DiskNumber = sd.DeviceNumber;
-
-	status = BitmapInit(ctx, ctx->DiskNumber, len_info.Length.QuadPart);
-	if (!NT_SUCCESS(status))
-		return STATUS_SUCCESS;
-
-	if (g_CtrlCtx)
-		FilterRegisterDisk(g_CtrlCtx, ctx->DiskNumber, ctx);
-
-	DbgPrint("go2cloud_flt: Disk%u ready — %u blocks, %u byte bitmap\n",
-		ctx->DiskNumber, ctx->TotalBlocks, ctx->BitmapSize);
-
+	WdfWorkItemEnqueue(workitem);
 	return STATUS_SUCCESS;
+}
+
+/* ---------------------------------------------------------------
+ * EvtDiskInitWorkItem — runs asynchronously after device enters D0.
+ * Queries disk number + size and allocates the dirty-block bitmap.
+ * Skips the boot disk entirely to avoid 0x7B INACCESSIBLE_BOOT_DEVICE.
+ * Wrapped in __try/__except to catch unexpected exceptions from
+ * lower storage drivers.
+ * --------------------------------------------------------------- */
+
+static VOID
+EvtDiskInitWorkItem(WDFWORKITEM WorkItem)
+{
+	WDFDEVICE Device = (WDFDEVICE)WdfWorkItemGetParentObject(WorkItem);
+	FILTER_DEVICE_CONTEXT *ctx = FilterGetContext(Device);
+	WDFIOTARGET target = WdfDeviceGetIoTarget(Device);
+	STORAGE_DEVICE_NUMBER sd = {0};
+	GET_LENGTH_INFORMATION len_info = {0};
+	WDF_MEMORY_DESCRIPTOR out_desc;
+	NTSTATUS status = STATUS_UNSUCCESSFUL;
+
+	__try {
+		WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&out_desc, &sd, sizeof(sd));
+		status = WdfIoTargetSendIoctlSynchronously(
+			target, NULL,
+			IOCTL_STORAGE_GET_DEVICE_NUMBER,
+			NULL, &out_desc, NULL, NULL);
+		if (!NT_SUCCESS(status))
+			__leave;
+
+		ctx->DiskNumber = sd.DeviceNumber;
+
+		/* Never query or track the boot disk — pass-through only */
+		if (sd.DeviceNumber == g_BootDiskNumber) {
+			DbgPrint("go2cloud_flt: Disk%u is boot disk, skipping\n",
+				sd.DeviceNumber);
+			__leave;
+		}
+
+		WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&out_desc, &len_info,
+			sizeof(len_info));
+		status = WdfIoTargetSendIoctlSynchronously(
+			target, NULL,
+			IOCTL_DISK_GET_LENGTH_INFO,
+			NULL, &out_desc, NULL, NULL);
+		if (!NT_SUCCESS(status))
+			__leave;
+
+		status = BitmapInit(ctx, sd.DeviceNumber,
+			len_info.Length.QuadPart);
+		if (!NT_SUCCESS(status))
+			__leave;
+
+		if (g_CtrlCtx)
+			FilterRegisterDisk(g_CtrlCtx, ctx->DiskNumber, ctx);
+
+		DbgPrint("go2cloud_flt: Disk%u ready — %u blocks, %u byte bitmap\n",
+			ctx->DiskNumber, ctx->TotalBlocks, ctx->BitmapSize);
+	}
+	__except(EXCEPTION_EXECUTE_HANDLER) {
+		DbgPrint("go2cloud_flt: exception during disk%u init, skipping\n",
+			sd.DeviceNumber);
+	}
+
+	WdfObjectDelete(WorkItem);
 }
 
 /* ---------------------------------------------------------------
@@ -250,11 +391,23 @@ EvtDeviceReleaseHardware(WDFDEVICE Device, WDFCMRESLIST ResourcesTranslated)
 
 	FILTER_DEVICE_CONTEXT *ctx = FilterGetContext(Device);
 
+	/* Lock ordering: TableLock → BitmapLock.
+	 * Matches FilterLookupDisk which acquires BitmapLock under TableLock.
+	 * This prevents FilterLookupDisk from returning ctx while we're
+	 * tearing it down, closing the UAF window. */
+	if (g_CtrlCtx)
+		WdfSpinLockAcquire(g_CtrlCtx->TableLock);
+	WdfSpinLockAcquire(ctx->BitmapLock);
+
 	if (ctx->Bitmap && ctx->DiskNumber != (ULONG)-1) {
 		if (g_CtrlCtx)
-			FilterUnregisterDisk(g_CtrlCtx, ctx->DiskNumber);
+			FilterUnregisterDiskLocked(g_CtrlCtx, ctx->DiskNumber);
 		BitmapFree(ctx);
 	}
+
+	WdfSpinLockRelease(ctx->BitmapLock);
+	if (g_CtrlCtx)
+		WdfSpinLockRelease(g_CtrlCtx->TableLock);
 
 	return STATUS_SUCCESS;
 }
@@ -281,6 +434,9 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 	status = CreateControlDevice(driver);
 	if (!NT_SUCCESS(status))
 		return status;
+
+	g_BootDiskNumber = GetBootDiskNumber();
+	DbgPrint("go2cloud_flt: boot disk = %u\n", g_BootDiskNumber);
 
 	DbgPrint("go2cloud_flt: loaded v%d.%d.%d\n",
 		DCBT_VERSION_MAJOR, DCBT_VERSION_MINOR, DCBT_VERSION_PATCH);
