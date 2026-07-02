@@ -102,6 +102,10 @@ struct sqlite_db {
     "SELECT version, start_time, end_time, scanned_count, changed_count " \
     "FROM T_VERSION WHERE remote_id=? ORDER BY version"
 
+#define SQL_GET_VERSION_HISTORY_ALL \
+    "SELECT version, start_time, end_time, scanned_count, changed_count " \
+    "FROM T_VERSION ORDER BY version"
+
 #define SQL_GET_VERSION_INFO \
     "SELECT version, start_time, end_time, scanned_count, changed_count " \
     "FROM T_VERSION WHERE version=? AND remote_id=?"
@@ -111,6 +115,9 @@ struct sqlite_db {
 
 #define SQL_COUNT_BLOCKS_BY_VERSION \
     "SELECT COUNT(*) FROM T_BLOCK WHERE version=? AND remote_id=?"
+
+#define SQL_COUNT_BLOCKS_BY_VERSION_ALL \
+    "SELECT COUNT(*) FROM T_BLOCK WHERE version=?"
 
 sqlite_db_t *sqlite_open(const char *db_path) {
     sqlite3 *handle = NULL;
@@ -663,13 +670,17 @@ int sqlite_count_unacked_v(sqlite_db_t *db, const char *remote_id,
 
 int sqlite_get_version_history(sqlite_db_t *db, const char *remote_id,
                                version_info_t *infos, int max_count) {
+    const char *rid = remote_id ? remote_id : db->remote_id;
+    int has_rid = (rid && rid[0]);
+
     sqlite3_stmt *stmt = NULL;
-    int rc = sqlite3_prepare_v2(db->handle, SQL_GET_VERSION_HISTORY,
-                                -1, &stmt, NULL);
+    const char *sql = has_rid ? SQL_GET_VERSION_HISTORY
+                              : SQL_GET_VERSION_HISTORY_ALL;
+    int rc = sqlite3_prepare_v2(db->handle, sql, -1, &stmt, NULL);
     if (rc != SQLITE_OK) return -1;
 
-    sqlite3_bind_text(stmt, 1, remote_id ? remote_id : db->remote_id,
-                      -1, SQLITE_STATIC);
+    if (has_rid)
+        sqlite3_bind_text(stmt, 1, rid, -1, SQLITE_STATIC);
 
     int count = 0;
     while (sqlite3_step(stmt) == SQLITE_ROW && count < max_count) {
@@ -714,14 +725,18 @@ int sqlite_get_version_info(sqlite_db_t *db, int version,
 
 int sqlite_count_blocks_by_version(sqlite_db_t *db, int version,
                                    const char *remote_id) {
+    const char *rid = remote_id ? remote_id : db->remote_id;
+    int has_rid = (rid && rid[0]);
+
     sqlite3_stmt *stmt = NULL;
-    int rc = sqlite3_prepare_v2(db->handle, SQL_COUNT_BLOCKS_BY_VERSION,
-                                -1, &stmt, NULL);
+    const char *sql = has_rid ? SQL_COUNT_BLOCKS_BY_VERSION
+                              : SQL_COUNT_BLOCKS_BY_VERSION_ALL;
+    int rc = sqlite3_prepare_v2(db->handle, sql, -1, &stmt, NULL);
     if (rc != SQLITE_OK) return -1;
 
     sqlite3_bind_int(stmt, 1, version);
-    sqlite3_bind_text(stmt, 2, remote_id ? remote_id : db->remote_id,
-                      -1, SQLITE_STATIC);
+    if (has_rid)
+        sqlite3_bind_text(stmt, 2, rid, -1, SQLITE_STATIC);
 
     int count = 0;
     if (sqlite3_step(stmt) == SQLITE_ROW) {

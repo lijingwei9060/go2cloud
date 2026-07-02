@@ -949,6 +949,7 @@ typedef struct {
     int             is_vss;            /* 1 = 读取器打开 VSS 快照路径, 0 = PhysicalDrive */
     char            name[16];          /* 分区名 (如 "C:") */
     int             part_index;        /* 分区在磁盘上的索引 (1-based) */
+    uint64_t        sent_count;        /* 本分区已发送块数 */
 } reader_entry_t;
 
 /*
@@ -1321,6 +1322,94 @@ static int should_finish(migrate_ctx_t *ctx, sqlite_db_t *db,
     return 0;
 }
 
+/* ================================================================
+ * 控制台进度显示 (VT100 兼容, Windows 10+)
+ * ================================================================ */
+static int _pp_lines = 0;  /* 上次打印的行数, 用于光标上移 */
+
+static void cursor_up(int n) {
+    if (n <= 0) return;
+    static int _vt_ready = 0;
+    if (!_vt_ready) {
+        HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+        DWORD mode = 0;
+        if (GetConsoleMode(h, &mode))
+            SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+        _vt_ready = 1;
+    }
+    printf("\x1b[%dA", n);
+}
+static void cursor_clear_below(void) {
+    printf("\x1b[J");
+}
+
+/* 增量扫描时每个分区的计数器 */
+typedef struct {
+    uint64_t scanned;
+    uint64_t changed;
+    uint64_t skipped;
+} part_inc_stat_t;
+
+/*
+ * 全量同步分区表 (带进度列), 原地更新。
+ */
+static void print_full_progress(reader_entry_t *readers, int count,
+                                 sqlite_db_t *db) {
+    if (_pp_lines > 0)
+        cursor_up(_pp_lines);
+
+    printf("\rPartitions to sync:\n");
+    printf("\r%-4s %-8s %-10s %-16s %-12s %-14s %-9s %-9s %6s\n",
+           "Idx", "Disk", "Part#", "Name", "Blocks", "Source",
+           "Sent", "Acked", "%");
+    printf("\r---- ---- -------- ---------------- ------------ -------------- --------- -------- ------\n");
+    for (int i = 0; i < count; i++) {
+        reader_entry_t *e = &readers[i];
+        uint64_t acked = db ? (uint64_t)sqlite_count_blocks(db, e->devno, 1) : 0;
+        double pct = e->block_count > 0
+            ? (double)e->sent_count * 100.0 / (double)e->block_count : 0.0;
+        printf("\r%-4d %-8d %-10d %-16s %-12llu %-14s %-9llu %-8llu %5.1f\n",
+               i, e->devno, e->part_index, e->name,
+               (unsigned long long)e->block_count,
+               e->is_vss ? "VSS" : "PhysicalDrive",
+               (unsigned long long)e->sent_count,
+               (unsigned long long)acked, pct);
+    }
+    fflush(stdout);
+    _pp_lines = count + 3;
+}
+
+/*
+ * 增量扫描分区表 (带进度列), 原地更新。
+ */
+static void print_incscan_progress(volume_list_t *vl, const int *active_idx,
+                                    int active_count,
+                                    const part_inc_stat_t *part_st) {
+    if (_pp_lines > 0)
+        cursor_up(_pp_lines);
+
+    printf("\rPartitions to sync:\n");
+    printf("\r%-4s %-8s %-10s %-16s %-8s %-14s %-9s %-9s %-9s\n",
+           "Idx", "Disk", "Part#", "Name", "Blocks", "Source",
+           "Scanned", "Changed", "Unchanged");
+    printf("\r---- ---- -------- ---------------- -------- -------------- --------- --------- ---------\n");
+    for (int i = 0; i < active_count; i++) {
+        volume_info_t *v = &vl->volumes[active_idx[i]];
+        const char *source = (v->name[0] && v->name[1] == ':') ? "VSS" : "PhysicalDrive";
+        printf("\r%-4d %-8d %-10d %-16s %-8llu %-14s %-9llu %-9llu %-9llu\n",
+               i, v->devno, v->part_index, v->name,
+               (unsigned long long)v->block_count, source,
+               (unsigned long long)part_st[i].scanned,
+               (unsigned long long)part_st[i].changed,
+               (unsigned long long)part_st[i].skipped);
+    }
+    fflush(stdout);
+    _pp_lines = active_count + 3;
+}
+
+/* 重置进度行计数 (模式切换时调用) */
+static void progress_reset(void) { _pp_lines = 0; }
+
 /*
  * 迁移主循环。
  */
@@ -1520,20 +1609,9 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
     }
 
     /* ================================================================
-     * 分区清单
+     * 分区清单 + 进度表
      * ================================================================ */
-    printf("\nPartitions to sync:\n");
-    printf("%-4s %-8s %-10s %-16s %-12s %s\n",
-           "Idx", "Disk", "Part#", "Name", "Blocks", "Source");
-    printf("---- ---- -------- ---------------- ------------ --------\n");
-    for (int i = 0; i < reader_count; i++) {
-        reader_entry_t *e = &readers[i];
-        printf("%-4d %-8d %-10d %-16s %-12llu %s\n",
-               i, e->devno, e->part_index, e->name,
-               (unsigned long long)e->block_count,
-               e->is_vss ? "VSS" : "PhysicalDrive");
-    }
-    printf("\n");
+    print_full_progress(readers, reader_count, db);
 
     /* ================================================================
      * 主传输循环
@@ -1543,6 +1621,7 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
     uint64_t sent_blocks  = 0;
     uint64_t total_bytes  = 0;
     ctx->total_blocks = 0;
+    progress_reset();
 
     for (int d = 0; d < reader_count && g_running; d++) {
         reader_entry_t *entry = &readers[d];
@@ -1598,6 +1677,7 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
             if (send_block(ctx, reader, db, entry->devno,
                           disk_offset, reader_offset, data_buf) == 0) {
                 sent_blocks++;
+                entry->sent_count++;
                 total_bytes += BLOCK_SIZE;
             }
 
@@ -1637,14 +1717,7 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
                     if (!ctx->dry_run) do_reconnect(ctx);
                     break;
                 case TIMER_ACTION: {
-                    int acked = ctx->db ? sqlite_count_blocks(ctx->db, -1, 1) : 0;
-                    double pct = ctx->total_blocks > 0
-                        ? (double)sent_blocks * 100.0 / (double)ctx->total_blocks : 0.0;
-                    printf("\rProgress: %llu/%llu blocks (%.1f%%) | acked=%d | queue=%d    ",
-                           (unsigned long long)sent_blocks,
-                           (unsigned long long)ctx->total_blocks,
-                           pct, acked, queue_count(&ctx->queue));
-                    fflush(stdout);
+                    print_full_progress(readers, reader_count, ctx->db);
                     LOG_INFO("progress: partition %d/%d block %llu/%llu "
                              "sent=%llu/%llu queue=%d%s",
                              d + 1, reader_count,
@@ -1712,6 +1785,7 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
             /* 前 1MB — 主 GPT 元数据 */
             if (send_block(ctx, disk, db, dno, 0, 0, data_buf) == 0) {
                 sent_blocks++;
+                readers[d].sent_count++;
                 total_bytes += BLOCK_SIZE;
             }
             while (flush_one(ctx) > 0) { }
@@ -1725,6 +1799,7 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
                     if (send_block(ctx, disk, db, dno,
                                   off, off, data_buf) == 0) {
                         sent_blocks++;
+                        readers[d].sent_count++;
                         total_bytes += BLOCK_SIZE;
                     }
                     while (flush_one(ctx) > 0) { }
@@ -1774,7 +1849,7 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
         ctx->inc_version = sqlite_get_next_version(db, remote_id);
         if (ctx->inc_version < 1) ctx->inc_version = 1;
         {
-            int64_t round_start = (int64_t)timer_now_ms();
+            int64_t round_start = (int64_t)time(NULL) * 1000;
             sqlite_version_start(db, ctx->inc_version, remote_id, round_start);
             LOG_INFO("incremental: starting version %d", ctx->inc_version);
         }
@@ -1803,7 +1878,7 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
 
                     /* 记录本轮结束 */
                     {
-                        int64_t round_end = (int64_t)timer_now_ms();
+                        int64_t round_end = (int64_t)time(NULL) * 1000;
                         sqlite_version_end(db, ctx->inc_version, remote_id,
                                           round_end, 0, requeued);
                     }
@@ -1816,7 +1891,7 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
                     } else {
                         /* 下一轮: 递增版本号, 开始新一轮 */
                         ctx->inc_version++;
-                        int64_t next_start = (int64_t)timer_now_ms();
+                        int64_t next_start = (int64_t)time(NULL) * 1000;
                         sqlite_version_start(db, ctx->inc_version, remote_id,
                                             next_start);
                     }
@@ -1829,15 +1904,12 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
                     if (!ctx->dry_run) do_reconnect(ctx);
                     break;
                 case TIMER_ACTION: {
-                    int unacked = sqlite_count_unacked(db, remote_id);
-                    int acked   = sqlite_count_blocks(db, -1, 1);
-                    printf("\rIncSync: round %d/%d | unacked=%d | acked=%d    ",
-                           ctx->inc_round, MAX_INCREMENTAL_ROUNDS, unacked, acked);
-                    fflush(stdout);
+                    print_full_progress(readers, reader_count, db);
                     LOG_INFO("incremental: round %d/%d, %d unacked blocks, "
                              "queue=%d, stable=%d rounds",
                              ctx->inc_round, MAX_INCREMENTAL_ROUNDS,
-                             unacked, queue_count(&ctx->queue),
+                             sqlite_count_unacked(db, remote_id),
+                             queue_count(&ctx->queue),
                              ctx->zero_change_rounds);
                     break;
                 }
@@ -1890,6 +1962,7 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
 
     LOG_INFO("migration complete: %llu blocks, %llu bytes",
              (unsigned long long)sent_blocks, (unsigned long long)total_bytes);
+    if (_pp_lines > 0) { cursor_clear_below(); progress_reset(); }
     printf("\n");
 
     /* ================================================================
@@ -2153,12 +2226,7 @@ static int cmd_incsync(int argc, char *argv[]) {
     }
     LOG_INFO("incsync: %d partitions enumerated", vol_list.count);
 
-    /* 打印并过滤分区 */
-    printf("Partitions to sync:\n");
-    printf("%-4s %-8s %-10s %-16s %-8s %s\n",
-           "Idx", "Disk", "Part#", "Name", "Blocks", "Source");
-    printf("---- ---- -------- ---------------- -------- --------\n");
-
+    /* 过滤分区 */
     int active_count = 0;
     int active_idx[64];
     for (int i = 0; i < vol_list.count; i++) {
@@ -2173,12 +2241,6 @@ static int cmd_incsync(int argc, char *argv[]) {
         if (!skipped && partition_is_skipped(skip_part_str, v->devno, v->part_index)) {
             skipped = 1;
         }
-
-        const char *source = skipped ? "SKIP" :
-            (v->name[0] && v->name[1] == ':') ? "VSS" : "PhysicalDrive";
-        printf("%-4d %-8d %-10d %-16s %-8llu %s\n",
-               i, v->devno, v->part_index, v->name,
-               (unsigned long long)v->block_count, source);
 
         if (!skipped) {
             active_idx[active_count++] = i;
@@ -2309,7 +2371,7 @@ static int cmd_incsync(int argc, char *argv[]) {
     int current_version = sqlite_get_next_version(db, remote_id);
     if (current_version < 1) current_version = 1;
     {
-        int64_t round_start = (int64_t)timer_now_ms();
+        int64_t round_start = (int64_t)time(NULL) * 1000;
         sqlite_version_start(db, current_version, remote_id, round_start);
         LOG_INFO("incsync: starting version %d", current_version);
     }
@@ -2324,12 +2386,20 @@ static int cmd_incsync(int argc, char *argv[]) {
     uint64_t blocks_skipped  = 0;
     uint64_t bytes_sent      = 0;
 
+    /* 每个活跃分区的计数器 */
+    part_inc_stat_t part_st[64];
+    memset(part_st, 0, sizeof(part_st));
+    progress_reset();
+
+    /* 首次打印分区进度表 */
+    print_incscan_progress(&vol_list, active_idx, active_count, part_st);
+
     /* 计算总块数 (仅活跃分区) */
     for (int ai = 0; ai < active_count; ai++) {
         total_blocks += vol_list.volumes[active_idx[ai]].block_count;
     }
 
-    for (int ai = 0; ai < active_count; ai++) {
+    for (int ai = 0; ai < active_count && g_running; ai++) {
         volume_info_t *vol = &vol_list.volumes[active_idx[ai]];
         LOG_INFO("incsync: scanning %s (devno=%d part=%d) %llu blocks...",
                  vol->name, vol->devno, vol->part_index,
@@ -2351,7 +2421,7 @@ static int cmd_incsync(int argc, char *argv[]) {
         uint64_t part_base = vol->partition_offset;
         uint64_t n_blocks  = vol->block_count;
 
-        for (uint64_t blk = 0; blk < n_blocks; blk++) {
+        for (uint64_t blk = 0; blk < n_blocks && g_running; blk++) {
             uint64_t disk_offset = part_base + blk * BLOCK_SIZE;
             uint32_t data_len = 0;
             uint64_t reader_offset = vol->has_vss
@@ -2366,6 +2436,7 @@ static int cmd_incsync(int argc, char *argv[]) {
             if (data_len == 0) continue;
 
             blocks_scanned++;
+            part_st[ai].scanned++;
             uint64_t new_hash = hash_block(data_buf, data_len,
                                            disk_offset & 0xFFFFFFFF);
 
@@ -2377,6 +2448,7 @@ static int cmd_incsync(int argc, char *argv[]) {
             if (lookup_rc == 0 && stored_hash == new_hash) {
                 /* 块未变化 — 标记为本轮已验证 */
                 blocks_skipped++;
+                part_st[ai].skipped++;
                 sqlite_update_last_sent(db, vol->devno,
                                         (int64_t)disk_offset, now_ms);
                 sqlite_block_mark_verified(db, vol->devno,
@@ -2414,6 +2486,7 @@ static int cmd_incsync(int argc, char *argv[]) {
                                       (int32_t)data_len, new_hash, 0,
                                       current_version);
                 blocks_changed++;
+                part_st[ai].changed++;
                 bytes_sent += data_len;
             }
 
@@ -2421,14 +2494,8 @@ static int cmd_incsync(int argc, char *argv[]) {
             if ((blocks_scanned & 1023) == 0) {
                 while (flush_one(&ctx) > 0) { }
                 process_ack(&ctx);
-                double pct = total_blocks > 0
-                    ? (double)blocks_scanned * 100.0 / (double)total_blocks : 0.0;
-                printf("\rIncSync: %llu/%llu blocks (%.1f%%) | changed=%llu | skipped=%llu    ",
-                       (unsigned long long)blocks_scanned,
-                       (unsigned long long)total_blocks, pct,
-                       (unsigned long long)blocks_changed,
-                       (unsigned long long)blocks_skipped);
-                fflush(stdout);
+                print_incscan_progress(&vol_list, active_idx, active_count,
+                                       part_st);
                 LOG_INFO("incsync: %llu scanned, %llu changed, %llu skipped",
                          (unsigned long long)blocks_scanned,
                          (unsigned long long)blocks_changed,
@@ -2483,7 +2550,7 @@ static int cmd_incsync(int argc, char *argv[]) {
 
     /* 记录本轮结束 */
     {
-        int64_t round_end = (int64_t)timer_now_ms();
+        int64_t round_end = (int64_t)time(NULL) * 1000;
         sqlite_version_end(db, current_version, remote_id, round_end,
                            (int)blocks_scanned, (int)blocks_changed);
         LOG_INFO("incsync: version %d ended, scanned=%d changed=%d",
@@ -2493,6 +2560,7 @@ static int cmd_incsync(int argc, char *argv[]) {
     /* ================================================================
      * 结果输出
      * ================================================================ */
+    if (_pp_lines > 0) { cursor_clear_below(); progress_reset(); }
     printf("\n");
     printf("========== IncSync Results ==========\n");
     printf("  Version:  %d\n", current_version);
