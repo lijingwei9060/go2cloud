@@ -172,6 +172,7 @@ typedef struct {
     int           ctl_end_sent;      /* 1 = ctlEndIncremental 已发送 */
     int           server_done_rcvd;  /* 1 = 已收到 SERVER_DONE */
     int           inc_round;         /* 增量轮次计数 */
+    int           inc_version;       /* 当前 T_VERSION 版本号 */
     int           zero_change_rounds;/* 连续无变化轮次数 */
     int           final_verify;      /* 1 = 正在执行最终验证轮 */
     int           dry_run;           /* 1 = dry-run mode, no network I/O */
@@ -266,6 +267,12 @@ static void print_block_detail(const block_info_t *b) {
     }
     printf("\n");
     printf("  hash       = %s\n",   hash_str);
+    printf("  version    = %d",     b->version);
+    if (b->version == 0) {
+        printf("  (full sync)\n");
+    } else {
+        printf("  (incremental round %d)\n", b->version);
+    }
     printf("  ack        = %d",     b->ack);
     printf("  (%s)\n",              b->ack ? "confirmed" : "pending");
     printf("  last_sent  = %lld\n", (long long)b->last_sent);
@@ -280,6 +287,8 @@ static int cmd_blockinfo(int argc, char *argv[]) {
     int64_t filter_offset = -1;
     int has_offset = 0;
     int filter_ack   = -1;  /* -1=all, 0=pending, 1=acked */
+    int filter_version = -1; /* -1=all, >=0 filter by version */
+    int show_history = 0;
 
     /* 解析参数 */
     int arg_idx = 2;
@@ -290,6 +299,10 @@ static int cmd_blockinfo(int argc, char *argv[]) {
             filter_ack = 1;
         } else if (strcmp(argv[arg_idx], "--all") == 0) {
             filter_ack = -1;
+        } else if (strcmp(argv[arg_idx], "--history") == 0) {
+            show_history = 1;
+        } else if (strncmp(argv[arg_idx], "--version=", 10) == 0) {
+            filter_version = atoi(argv[arg_idx] + 10);
         }
         arg_idx++;
     }
@@ -338,9 +351,9 @@ static int cmd_blockinfo(int argc, char *argv[]) {
                label, acked, pending);
 
         if (total > 0) {
-            printf("%-8s %-16s %-10s %-18s %-3s\n",
-                   "devno", "offset", "size", "hash", "ack");
-            printf("-------- ---------------- ---------- ------------------ ---\n");
+            printf("%-8s %-16s %-10s %-18s %-3s %-3s\n",
+                   "devno", "offset", "size", "hash", "ack", "ver");
+            printf("-------- ---------------- ---------- ------------------ --- ---\n");
 
             int cap = filter_ack == 0 ? pending : filter_ack == 1 ? acked : total;
             if (cap > 0) {
@@ -349,15 +362,17 @@ static int cmd_blockinfo(int argc, char *argv[]) {
                 int n = sqlite_list_blocks(db, filter_devno, list, total);
                 for (int i = 0; i < n; i++) {
                     if (filter_ack >= 0 && list[i].ack != filter_ack) continue;
+                    if (filter_version >= 0 && list[i].version != filter_version) continue;
                     char hash_str[32];
                     snprintf(hash_str, sizeof(hash_str), "0x%016llx",
                              (unsigned long long)list[i].hash);
-                    printf("%-8d %-16lld %-10d %-18s %-3d\n",
+                    printf("%-8d %-16lld %-10d %-18s %-3d %-3d\n",
                            (int)list[i].devno,
                            (long long)list[i].offset,
                            (int)list[i].size,
                            hash_str,
-                           list[i].ack);
+                           list[i].ack,
+                           list[i].version);
                 }
                 free(list);
             }
@@ -381,6 +396,43 @@ static int cmd_blockinfo(int argc, char *argv[]) {
         }
         printf("\n");
 
+        /* 版本历史 */
+        if (show_history) {
+            version_info_t vinfos[64];
+            int vn = sqlite_get_version_history(db, NULL, vinfos, 64);
+            if (vn > 0) {
+                printf("\n  Version History:\n");
+                printf("  %-5s %-20s %-20s %-8s %-8s %-10s\n",
+                       "Ver", "Start Time", "End Time", "Scanned", "Changed", "Duration");
+                printf("  ----- -------------------- -------------------- -------- -------- ----------\n");
+                for (int i = 0; i < vn; i++) {
+                    char start_buf[32], end_buf[32];
+                    time_t st = (time_t)(vinfos[i].start_time / 1000);
+                    time_t et = (time_t)(vinfos[i].end_time / 1000);
+                    struct tm tm_st, tm_et;
+#ifdef _WIN32
+                    localtime_s(&tm_st, &st);
+                    localtime_s(&tm_et, &et);
+#else
+                    localtime_r(&st, &tm_st);
+                    localtime_r(&et, &tm_et);
+#endif
+                    strftime(start_buf, sizeof(start_buf), "%Y-%m-%d %H:%M:%S", &tm_st);
+                    strftime(end_buf, sizeof(end_buf), "%Y-%m-%d %H:%M:%S", &tm_et);
+                    int64_t duration_s = vinfos[i].end_time > vinfos[i].start_time
+                        ? (vinfos[i].end_time - vinfos[i].start_time) / 1000 : 0;
+                    printf("  %-5d %-20s %-20s %-8d %-8d %-10llds\n",
+                           vinfos[i].version,
+                           start_buf, end_buf,
+                           vinfos[i].scanned_count,
+                           vinfos[i].changed_count,
+                           (long long)duration_s);
+                }
+            } else {
+                printf("\n  No version history found.\n");
+            }
+        }
+
         /* 按磁盘分别统计 */
         if (total > 0) {
             printf("\n  Per-disk breakdown:\n");
@@ -393,6 +445,21 @@ static int cmd_blockinfo(int argc, char *argv[]) {
                 int da = sqlite_count_blocks(db, d, 1);
                 int dp = sqlite_count_blocks(db, d, 0);
                 printf("  %-6d %-8d %-8d %-8d\n", d, dt, da, dp);
+            }
+        }
+
+        /* 按版本统计块数 */
+        if (total > 0 && !show_history) {
+            version_info_t vinfos[64];
+            int vn = sqlite_get_version_history(db, NULL, vinfos, 64);
+            if (vn > 0) {
+                printf("\n  Per-version block count:\n");
+                printf("  %-5s %-8s\n", "Ver", "Blocks");
+                printf("  ----- --------\n");
+                for (int i = 0; i < vn; i++) {
+                    int bc = sqlite_count_blocks_by_version(db, vinfos[i].version, NULL);
+                    printf("  %-5d %-8d\n", vinfos[i].version, bc);
+                }
             }
         }
     }
@@ -727,6 +794,9 @@ static int send_block(migrate_ctx_t *ctx, block_reader_t *reader,
 
     /* 计算哈希 (使用 disk_offset 的低 32 位作为种子的组成部分) */
     uint64_t h = hash_block(data_buf, data_len, disk_offset & 0xFFFFFFFF);
+    LOG_INFO("send_block: devno=%d offset=%llu size=%u hash=0x%016llx",
+             devno, (unsigned long long)disk_offset, data_len,
+             (unsigned long long)h);
 
     /* 增量去重: 仅 TailSend 模式下查询 SQLite 对比 hash */
     if (ctx->tail_send) {
@@ -785,8 +855,8 @@ static int send_block(migrate_ctx_t *ctx, block_reader_t *reader,
     }
 
     /* 更新 SQLite */
-    sqlite_block_upsert(db, devno, (int64_t)disk_offset,
-                        (int32_t)data_len, h, 0);
+    sqlite_block_upsert_v(db, devno, (int64_t)disk_offset,
+                          (int32_t)data_len, h, 0, ctx->inc_version);
 
     return 0;
 }
@@ -955,7 +1025,8 @@ static int do_incremental_round(migrate_ctx_t *ctx,
                                   reader_entry_t *live_readers,
                                   reader_entry_t *vss_readers,
                                   int reader_count,
-                                  sqlite_db_t *db, uint8_t *data_buf) {
+                                  sqlite_db_t *db, uint8_t *data_buf,
+                                  int current_version) {
     int32_t  devnos[4096];
     int64_t  offsets[4096];
     uint64_t hashes[4096];
@@ -1031,14 +1102,19 @@ static int do_incremental_round(migrate_ctx_t *ctx,
         uint64_t new_hash = hash_block(data_buf, data_len, disk_offset & 0xFFFFFFFF);
         if (new_hash == old_hash) {
             /* 块未变化 — live disk 与已发送数据一致, 标记为稳定 (ack=1) */
-            sqlite_block_mark_acked(db, devno, (int64_t)disk_offset);
+            if (current_version > 0) {
+                sqlite_block_mark_verified(db, devno, (int64_t)disk_offset,
+                                           current_version);
+            } else {
+                sqlite_block_mark_acked(db, devno, (int64_t)disk_offset);
+            }
             /* 更新 last_sent: 确保 ORDER BY last_sent 将此块排到队尾,
              * 让本轮尚未检查的块 (如高 offset 的 D 盘) 下轮优先被选中 */
             sqlite_update_last_sent(db, devno, (int64_t)disk_offset, now_ms);
             continue;
         }
 
-        LOG_DEBUG("incremental: changed block devno=%d offset=%llu "
+        LOG_INFO("incremental: changed block devno=%d offset=%llu "
                   "old_hash=0x%016llx new_hash=0x%016llx",
                   devno, (unsigned long long)disk_offset,
                   (unsigned long long)old_hash, (unsigned long long)new_hash);
@@ -1069,8 +1145,9 @@ static int do_incremental_round(migrate_ctx_t *ctx,
         }
         if (rc == 0) {
             /* 更新 SQLite: 新 hash + ack=0 (等待确认) */
-            sqlite_block_upsert(db, devno, (int64_t)disk_offset,
-                                (int32_t)data_len, new_hash, 0);
+            sqlite_block_upsert_v(db, devno, (int64_t)disk_offset,
+                                  (int32_t)data_len, new_hash, 0,
+                                  current_version);
             sqlite_update_last_sent(db, devno, (int64_t)disk_offset,
                                      (int64_t)timer_now_ms());
             requeued++;
@@ -1160,11 +1237,14 @@ static int timer_cb_real(migrate_ctx_t *ctx) {
  *
  * 返回 1 表示应该结束, 0 表示继续增量同步。
  */
-static int should_finish(migrate_ctx_t *ctx, sqlite_db_t *db, int requeued) {
+static int should_finish(migrate_ctx_t *ctx, sqlite_db_t *db,
+                          int requeued, int current_version) {
     char remote_id[256];
     snprintf(remote_id, sizeof(remote_id), "%s:%d",
              ctx->server_ip, (int)ctx->server_port);
-    int unacked = sqlite_count_unacked(db, remote_id);
+    int unacked = (current_version > 0)
+        ? sqlite_count_unacked_v(db, remote_id, current_version)
+        : sqlite_count_unacked(db, remote_id);
     int total   = sqlite_count_blocks(db, -1, -1);
 
     /* 条件 1: 完美收敛 — 零未确认块 */
@@ -1493,7 +1573,7 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
                     if (ctx->tail_send) {
                         ctx->inc_round++;
                         int req = do_incremental_round(ctx, readers, readers,
-                                                       reader_count, db, data_buf);
+                                                       reader_count, db, data_buf, 0);
                         LOG_DEBUG("inc-round #%d (in full sync): %d re-sent",
                                   ctx->inc_round, req);
                     }
@@ -1629,16 +1709,13 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
         /* inc_round 继续计数 (全量同步期间可能已执行若干轮) */
         ctx->zero_change_rounds = 0;
 
-        /* 如果所有块都是 ack=1 (上次会话遗留或全量同步期间全部验证稳定),
-         * 重置为 ack=0, 触发从 live disk 重读验证。*/
+        /* 获取下一个版本号, 记录本轮增量同步开始 */
+        ctx->inc_version = sqlite_get_next_version(db, remote_id);
+        if (ctx->inc_version < 1) ctx->inc_version = 1;
         {
-            int unacked = sqlite_count_unacked(db, remote_id);
-            int acked   = sqlite_count_blocks(db, -1, 1);
-            if (unacked == 0 && acked > 0) {
-                int reset = sqlite_reset_acked(db, remote_id);
-                LOG_INFO("incremental: reset %d blocks inherited from prior session, "
-                         "re-verifying from live disk", reset);
-            }
+            int64_t round_start = (int64_t)timer_now_ms();
+            sqlite_version_start(db, ctx->inc_version, remote_id, round_start);
+            LOG_INFO("incremental: starting version %d", ctx->inc_version);
         }
 
         while (g_running && !ctx->all_done) {
@@ -1654,19 +1731,33 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
                 case TIMER_INCREMENTAL: {
                     ctx->inc_round++;
                     int requeued = do_incremental_round(ctx, readers, readers,
-                                                         reader_count, db, data_buf);
-                    LOG_INFO("incremental round %d/%d: %d blocks re-sent, "
+                                                         reader_count, db, data_buf,
+                                                         ctx->inc_version);
+                    LOG_INFO("incremental round %d/%d (version %d): %d blocks re-sent, "
                              "%d unacked, %d stable rounds",
                              ctx->inc_round, MAX_INCREMENTAL_ROUNDS,
-                             requeued,
-                             sqlite_count_unacked(db, remote_id),
+                             ctx->inc_version, requeued,
+                             sqlite_count_unacked_v(db, remote_id, ctx->inc_version + 1),
                              ctx->zero_change_rounds);
 
+                    /* 记录本轮结束 */
+                    {
+                        int64_t round_end = (int64_t)timer_now_ms();
+                        sqlite_version_end(db, ctx->inc_version, remote_id,
+                                          round_end, 0, requeued);
+                    }
+
                     /* 检查是否应该结束 (完美收敛 / 稳定收敛 / 超时) */
-                    if (should_finish(ctx, db, requeued)) {
+                    if (should_finish(ctx, db, requeued, ctx->inc_version)) {
                         if (timer_cb_real(ctx)) {
                             break;  /* allDone — 退出定时器循环 */
                         }
+                    } else {
+                        /* 下一轮: 递增版本号, 开始新一轮 */
+                        ctx->inc_version++;
+                        int64_t next_start = (int64_t)timer_now_ms();
+                        sqlite_version_start(db, ctx->inc_version, remote_id,
+                                            next_start);
                     }
                     break;
                 }
@@ -1704,11 +1795,10 @@ static int do_migrate(migrate_ctx_t *ctx, volume_list_t *vol_list) {
 #endif
         }
 
-        /* 清理块跟踪表 (原始行为: allDone=1 → DELETE FROM T_BLOCK → exit) */
+        /* 迁移完成 — T_BLOCK 保留以便后续 incsync 参考 */
         if (ctx->all_done) {
-            LOG_INFO("incremental sync complete after %d rounds, clearing T_BLOCK",
-                     ctx->inc_round);
-            sqlite_clear_all_blocks(db);
+            LOG_INFO("incremental sync complete after %d rounds (version %d)",
+                     ctx->inc_round, ctx->inc_version);
         }
     } else {
         /* 非增量模式: 发送 ctlEndIncremental 结束传输 */
@@ -2083,13 +2173,14 @@ static int cmd_incsync(int argc, char *argv[]) {
     }
 
     /* ================================================================
-     * 重置 ack=1 → ack=0, 触发所有块从 live disk 重读验证
+     * 获取下一版本号, 开始本轮增量同步
      * ================================================================ */
-    int total_acked = sqlite_count_blocks(db, -1, 1);
-    if (total_acked > 0) {
-        int reset = sqlite_reset_acked(db, remote_id);
-        LOG_INFO("incsync: reset %d blocks (ack=1 → ack=0) for re-verification",
-                 reset);
+    int current_version = sqlite_get_next_version(db, remote_id);
+    if (current_version < 1) current_version = 1;
+    {
+        int64_t round_start = (int64_t)timer_now_ms();
+        sqlite_version_start(db, current_version, remote_id, round_start);
+        LOG_INFO("incsync: starting version %d", current_version);
     }
 
     /* ================================================================
@@ -2138,14 +2229,19 @@ static int cmd_incsync(int argc, char *argv[]) {
                                                 (int64_t)disk_offset,
                                                 &stored_hash);
             if (lookup_rc == 0 && stored_hash == new_hash) {
-                /* 块未变化 */
+                /* 块未变化 — 标记为本轮已验证 */
                 blocks_skipped++;
                 sqlite_update_last_sent(db, vol->devno,
                                         (int64_t)disk_offset, now_ms);
-                sqlite_block_mark_acked(db, vol->devno,
-                                        (int64_t)disk_offset);
+                sqlite_block_mark_verified(db, vol->devno,
+                                           (int64_t)disk_offset,
+                                           current_version);
             } else {
                 /* 块变化或新增 → MsgPack 编码 → 入队 */
+                LOG_INFO("incsync: changed block devno=%d offset=%llu "
+                         "hash=0x%016llx",
+                         vol->devno, (unsigned long long)disk_offset,
+                         (unsigned long long)new_hash);
                 if (msgpack_encode_block(&ctx.mp_writer, vol->devno,
                                          (int64_t)disk_offset,
                                          data_buf, data_len) != 0) {
@@ -2168,8 +2264,9 @@ static int cmd_incsync(int argc, char *argv[]) {
 #endif
                 }
 
-                sqlite_block_upsert(db, vol->devno, (int64_t)disk_offset,
-                                    (int32_t)data_len, new_hash, 0);
+                sqlite_block_upsert_v(db, vol->devno, (int64_t)disk_offset,
+                                      (int32_t)data_len, new_hash, 0,
+                                      current_version);
                 blocks_changed++;
                 bytes_sent += data_len;
             }
@@ -2222,11 +2319,21 @@ static int cmd_incsync(int argc, char *argv[]) {
 #endif
     }
 
+    /* 记录本轮结束 */
+    {
+        int64_t round_end = (int64_t)timer_now_ms();
+        sqlite_version_end(db, current_version, remote_id, round_end,
+                           (int)blocks_scanned, (int)blocks_changed);
+        LOG_INFO("incsync: version %d ended, scanned=%d changed=%d",
+                 current_version, (int)blocks_scanned, (int)blocks_changed);
+    }
+
     /* ================================================================
      * 结果输出
      * ================================================================ */
     printf("\n");
     printf("========== IncSync Results ==========\n");
+    printf("  Version:  %d\n", current_version);
     printf("  Scanned:  %llu blocks\n",   (unsigned long long)blocks_scanned);
     printf("  Skipped:  %llu (unchanged)\n", (unsigned long long)blocks_skipped);
     printf("  Changed:  %llu blocks\n",   (unsigned long long)blocks_changed);

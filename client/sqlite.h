@@ -138,8 +138,18 @@ typedef struct {
     uint64_t hash;
     int      ack;
     int64_t  last_sent;
+    int      version;
     char     remote_id[256];
 } block_info_t;
+
+/* 版本/轮次信息 */
+typedef struct {
+    int      version;
+    int64_t  start_time;
+    int64_t  end_time;
+    int      scanned_count;
+    int      changed_count;
+} version_info_t;
 
 /*
  * 查询单个块的所有信息。
@@ -171,5 +181,71 @@ int sqlite_count_blocks(sqlite_db_t *db, int32_t devno, int ack);
  * 返回重置的行数, 错误返回 -1。
  */
 int sqlite_reset_acked(sqlite_db_t *db, const char *remote_id);
+
+/* ================================================================
+ * 版本/轮次管理 (T_VERSION)
+ * ================================================================ */
+
+/*
+ * 获取下一个版本号 (自动递增)。
+ * 查询 T_VERSION 中的 MAX(version)+1, 若表为空则返回 1。
+ * 按 remote_id 分组, 不同服务端各自计数。
+ */
+int sqlite_get_next_version(sqlite_db_t *db, const char *remote_id);
+
+/*
+ * 记录一轮同步开始。
+ * 在 T_VERSION 中插入一行 (version, remote_id, start_time)。
+ */
+int sqlite_version_start(sqlite_db_t *db, int version,
+                         const char *remote_id, int64_t start_time_ms);
+
+/*
+ * 记录一轮同步结束。
+ * 更新 T_VERSION 的 end_time, 并累加 scanned_count 和 changed_count。
+ */
+int sqlite_version_end(sqlite_db_t *db, int version,
+                       const char *remote_id, int64_t end_time_ms,
+                       int scanned_delta, int changed_delta);
+
+/*
+ * Upsert 块记录 (带版本号)。
+ * 与 sqlite_block_upsert 相同, 但显式指定 version 列。
+ */
+int sqlite_block_upsert_v(sqlite_db_t *db, int32_t devno, int64_t offset,
+                          int32_t size, uint64_t hash, int ack, int version);
+
+/*
+ * 标记块为已在本轮验证 (设置 version + ack=1)。
+ * 用于增量同步中 hash 未变化的块。
+ */
+int sqlite_block_mark_verified(sqlite_db_t *db, int32_t devno,
+                               int64_t offset, int version);
+
+/*
+ * 统计未确认块数 (按版本过滤)。
+ * 仅统计 version < before_version 且 ack=0 的块。
+ */
+int sqlite_count_unacked_v(sqlite_db_t *db, const char *remote_id,
+                           int before_version);
+
+/*
+ * 查询版本历史。
+ * 返回 T_VERSION 表中指定 remote_id 的所有轮次信息。
+ */
+int sqlite_get_version_history(sqlite_db_t *db, const char *remote_id,
+                               version_info_t *infos, int max_count);
+
+/*
+ * 查询单个版本信息。
+ */
+int sqlite_get_version_info(sqlite_db_t *db, int version,
+                            const char *remote_id, version_info_t *info);
+
+/*
+ * 统计指定版本的块数。
+ */
+int sqlite_count_blocks_by_version(sqlite_db_t *db, int version,
+                                   const char *remote_id);
 
 #endif /* CLIENT_SQLITE_H */

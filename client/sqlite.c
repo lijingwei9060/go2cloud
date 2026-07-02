@@ -29,10 +29,12 @@ struct sqlite_db {
     "  hash      INTEGER," \
     "  ack       INTEGER DEFAULT 0," \
     "  last_sent INTEGER DEFAULT 0," \
+    "  version   INTEGER DEFAULT 0," \
     "  remote_id TEXT" \
     ");" \
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_block ON T_BLOCK(devno, offset);" \
-    "CREATE INDEX IF NOT EXISTS idx_ack ON T_BLOCK(ack);"
+    "CREATE INDEX IF NOT EXISTS idx_ack ON T_BLOCK(ack);" \
+    "CREATE INDEX IF NOT EXISTS idx_version ON T_BLOCK(remote_id, version);"
 
 #define SQL_LOOKUP \
     "SELECT hash FROM T_BLOCK WHERE devno=? AND offset=?"
@@ -64,6 +66,52 @@ struct sqlite_db {
 #define SQL_RESET_ACKED \
     "UPDATE T_BLOCK SET ack=0 WHERE ack=1 AND remote_id=?"
 
+/* 版本化 upsert */
+#define SQL_UPSERT_V \
+    "INSERT OR REPLACE INTO T_BLOCK(devno, offset, size, hash, ack, last_sent, version, remote_id) " \
+    "VALUES(?, ?, ?, ?, ?, ?, ?, ?)"
+
+/* 标记块在指定版本中已验证 */
+#define SQL_MARK_VERIFIED \
+    "UPDATE T_BLOCK SET version=?, ack=1 WHERE devno=? AND offset=?"
+
+/* T_VERSION 操作 */
+#define SQL_CREATE_T_VERSION \
+    "CREATE TABLE IF NOT EXISTS T_VERSION(" \
+    "  id            INTEGER PRIMARY KEY AUTOINCREMENT," \
+    "  version       INTEGER NOT NULL," \
+    "  remote_id     TEXT," \
+    "  start_time    INTEGER," \
+    "  end_time      INTEGER," \
+    "  scanned_count INTEGER DEFAULT 0," \
+    "  changed_count INTEGER DEFAULT 0" \
+    ");" \
+    "CREATE INDEX IF NOT EXISTS idx_version_remote ON T_VERSION(remote_id, version);"
+
+#define SQL_NEXT_VERSION \
+    "SELECT COALESCE(MAX(version), 0) + 1 FROM T_VERSION WHERE remote_id=?"
+
+#define SQL_INSERT_VERSION \
+    "INSERT INTO T_VERSION(version, remote_id, start_time) VALUES(?, ?, ?)"
+
+#define SQL_UPDATE_VERSION_END \
+    "UPDATE T_VERSION SET end_time=?, scanned_count=scanned_count+?, " \
+    "changed_count=changed_count+? WHERE version=? AND remote_id=?"
+
+#define SQL_GET_VERSION_HISTORY \
+    "SELECT version, start_time, end_time, scanned_count, changed_count " \
+    "FROM T_VERSION WHERE remote_id=? ORDER BY version"
+
+#define SQL_GET_VERSION_INFO \
+    "SELECT version, start_time, end_time, scanned_count, changed_count " \
+    "FROM T_VERSION WHERE version=? AND remote_id=?"
+
+#define SQL_COUNT_UNACKED_V \
+    "SELECT COUNT(*) FROM T_BLOCK WHERE ack=0 AND remote_id=? AND version < ?"
+
+#define SQL_COUNT_BLOCKS_BY_VERSION \
+    "SELECT COUNT(*) FROM T_BLOCK WHERE version=? AND remote_id=?"
+
 sqlite_db_t *sqlite_open(const char *db_path) {
     sqlite3 *handle = NULL;
     int rc = sqlite3_open(db_path, &handle);
@@ -85,6 +133,44 @@ sqlite_db_t *sqlite_open(const char *db_path) {
     rc = sqlite3_exec(handle, SQL_CREATE_TABLE, NULL, NULL, &err);
     if (rc != SQLITE_OK) {
         LOG_ERROR("sqlite: CREATE TABLE failed: %s", err);
+        sqlite3_free(err);
+        sqlite3_close(handle);
+        return NULL;
+    }
+
+    /* 迁移: 为已有数据库添加 version 列 */
+    {
+        sqlite3_stmt *stmt = NULL;
+        int has_version = 0;
+        rc = sqlite3_prepare_v2(handle, "PRAGMA table_info(T_BLOCK)",
+                                -1, &stmt, NULL);
+        if (rc == SQLITE_OK) {
+            while (sqlite3_step(stmt) == SQLITE_ROW) {
+                const char *col = (const char *)sqlite3_column_text(stmt, 1);
+                if (col && strcmp(col, "version") == 0) {
+                    has_version = 1;
+                    break;
+                }
+            }
+            sqlite3_finalize(stmt);
+        }
+        if (!has_version) {
+            rc = sqlite3_exec(handle,
+                "ALTER TABLE T_BLOCK ADD COLUMN version INTEGER DEFAULT 0",
+                NULL, NULL, &err);
+            if (rc != SQLITE_OK) {
+                LOG_WARN("sqlite: ALTER TABLE ADD version failed: %s", err);
+                sqlite3_free(err);
+            } else {
+                LOG_INFO("sqlite: added version column to existing T_BLOCK");
+            }
+        }
+    }
+
+    /* 创建 T_VERSION 表 */
+    rc = sqlite3_exec(handle, SQL_CREATE_T_VERSION, NULL, NULL, &err);
+    if (rc != SQLITE_OK) {
+        LOG_ERROR("sqlite: CREATE T_VERSION failed: %s", err);
         sqlite3_free(err);
         sqlite3_close(handle);
         return NULL;
@@ -190,10 +276,15 @@ int sqlite_block_acked(sqlite_db_t *db, int32_t devno, int64_t offset) {
 
 int sqlite_block_upsert(sqlite_db_t *db, int32_t devno, int64_t offset,
                         int32_t size, uint64_t hash, int ack) {
+    return sqlite_block_upsert_v(db, devno, offset, size, hash, ack, 0);
+}
+
+int sqlite_block_upsert_v(sqlite_db_t *db, int32_t devno, int64_t offset,
+                          int32_t size, uint64_t hash, int ack, int version) {
     sqlite3_stmt *stmt = NULL;
-    int rc = sqlite3_prepare_v2(db->handle, SQL_UPSERT, -1, &stmt, NULL);
+    int rc = sqlite3_prepare_v2(db->handle, SQL_UPSERT_V, -1, &stmt, NULL);
     if (rc != SQLITE_OK) {
-        LOG_ERROR("sqlite_upsert: prepare failed: %s", sqlite3_errmsg(db->handle));
+        LOG_ERROR("sqlite_upsert_v: prepare failed: %s", sqlite3_errmsg(db->handle));
         return -1;
     }
 
@@ -202,14 +293,15 @@ int sqlite_block_upsert(sqlite_db_t *db, int32_t devno, int64_t offset,
     sqlite3_bind_int(stmt, 3, size);
     sqlite3_bind_int64(stmt, 4, (sqlite3_int64)hash);
     sqlite3_bind_int(stmt, 5, ack);
-    sqlite3_bind_int64(stmt, 6, 0);  /* last_sent: 0 until sent */
-    sqlite3_bind_text(stmt, 7, db->remote_id, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(stmt, 6, 0);  /* last_sent */
+    sqlite3_bind_int(stmt, 7, version);
+    sqlite3_bind_text(stmt, 8, db->remote_id, -1, SQLITE_STATIC);
 
     rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
 
     if (rc != SQLITE_DONE) {
-        LOG_ERROR("sqlite_upsert: step failed: %s", sqlite3_errmsg(db->handle));
+        LOG_ERROR("sqlite_upsert_v: step failed: %s", sqlite3_errmsg(db->handle));
         return -1;
     }
     return 0;
@@ -299,7 +391,7 @@ int sqlite_get_block_info(sqlite_db_t *db, int32_t devno, int64_t offset,
                           block_info_t *info) {
     sqlite3_stmt *stmt = NULL;
     const char *sql = "SELECT devno, offset, size, hash, ack, last_sent, "
-                      "IFNULL(remote_id, '') FROM T_BLOCK "
+                      "IFNULL(version, 0), IFNULL(remote_id, '') FROM T_BLOCK "
                       "WHERE devno=? AND offset=?";
     int rc = sqlite3_prepare_v2(db->handle, sql, -1, &stmt, NULL);
     if (rc != SQLITE_OK) return -2;
@@ -316,7 +408,8 @@ int sqlite_get_block_info(sqlite_db_t *db, int32_t devno, int64_t offset,
         info->hash      = (uint64_t)sqlite3_column_int64(stmt, 3);
         info->ack       = sqlite3_column_int(stmt, 4);
         info->last_sent = sqlite3_column_int64(stmt, 5);
-        const unsigned char *rid = sqlite3_column_text(stmt, 6);
+        info->version   = sqlite3_column_int(stmt, 6);
+        const unsigned char *rid = sqlite3_column_text(stmt, 7);
         if (rid) {
             strncpy(info->remote_id, (const char *)rid,
                     sizeof(info->remote_id) - 1);
@@ -335,11 +428,11 @@ int sqlite_list_blocks(sqlite_db_t *db, int32_t devno,
     const char *sql;
     if (devno >= 0) {
         sql = "SELECT devno, offset, size, hash, ack, last_sent, "
-              "IFNULL(remote_id, '') FROM T_BLOCK "
+              "IFNULL(version, 0), IFNULL(remote_id, '') FROM T_BLOCK "
               "WHERE devno=? ORDER BY offset LIMIT ?";
     } else {
         sql = "SELECT devno, offset, size, hash, ack, last_sent, "
-              "IFNULL(remote_id, '') FROM T_BLOCK "
+              "IFNULL(version, 0), IFNULL(remote_id, '') FROM T_BLOCK "
               "ORDER BY devno, offset LIMIT ?";
     }
     int rc = sqlite3_prepare_v2(db->handle, sql, -1, &stmt, NULL);
@@ -361,7 +454,8 @@ int sqlite_list_blocks(sqlite_db_t *db, int32_t devno,
         info->hash      = (uint64_t)sqlite3_column_int64(stmt, 3);
         info->ack       = sqlite3_column_int(stmt, 4);
         info->last_sent = sqlite3_column_int64(stmt, 5);
-        const unsigned char *rid = sqlite3_column_text(stmt, 6);
+        info->version   = sqlite3_column_int(stmt, 6);
+        const unsigned char *rid = sqlite3_column_text(stmt, 7);
         if (rid) {
             strncpy(info->remote_id, (const char *)rid,
                     sizeof(info->remote_id) - 1);
@@ -434,6 +528,199 @@ int sqlite_count_unacked(sqlite_db_t *db, const char *remote_id) {
     if (rc != SQLITE_OK) return -1;
 
     sqlite3_bind_text(stmt, 1, remote_id ? remote_id : db->remote_id,
+                      -1, SQLITE_STATIC);
+
+    int count = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        count = sqlite3_column_int(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    return count;
+}
+
+/* ================================================================
+ * 版本/轮次管理
+ * ================================================================ */
+
+int sqlite_get_next_version(sqlite_db_t *db, const char *remote_id) {
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db->handle, SQL_NEXT_VERSION, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) return -1;
+
+    sqlite3_bind_text(stmt, 1, remote_id ? remote_id : db->remote_id,
+                      -1, SQLITE_STATIC);
+
+    int version = 1;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        version = sqlite3_column_int(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    return version;
+}
+
+int sqlite_version_start(sqlite_db_t *db, int version,
+                         const char *remote_id, int64_t start_time_ms) {
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db->handle, SQL_INSERT_VERSION, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        LOG_ERROR("sqlite_version_start: prepare failed: %s",
+                  sqlite3_errmsg(db->handle));
+        return -1;
+    }
+
+    sqlite3_bind_int(stmt, 1, version);
+    sqlite3_bind_text(stmt, 2, remote_id ? remote_id : db->remote_id,
+                      -1, SQLITE_STATIC);
+    sqlite3_bind_int64(stmt, 3, start_time_ms);
+
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+
+    if (rc != SQLITE_DONE) {
+        LOG_ERROR("sqlite_version_start: step failed: %s",
+                  sqlite3_errmsg(db->handle));
+        return -1;
+    }
+    LOG_INFO("sqlite: version %d started", version);
+    return 0;
+}
+
+int sqlite_version_end(sqlite_db_t *db, int version,
+                       const char *remote_id, int64_t end_time_ms,
+                       int scanned_delta, int changed_delta) {
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db->handle, SQL_UPDATE_VERSION_END,
+                                -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        LOG_ERROR("sqlite_version_end: prepare failed: %s",
+                  sqlite3_errmsg(db->handle));
+        return -1;
+    }
+
+    sqlite3_bind_int64(stmt, 1, end_time_ms);
+    sqlite3_bind_int(stmt, 2, scanned_delta);
+    sqlite3_bind_int(stmt, 3, changed_delta);
+    sqlite3_bind_int(stmt, 4, version);
+    sqlite3_bind_text(stmt, 5, remote_id ? remote_id : db->remote_id,
+                      -1, SQLITE_STATIC);
+
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+
+    if (rc != SQLITE_DONE) {
+        LOG_ERROR("sqlite_version_end: step failed: %s",
+                  sqlite3_errmsg(db->handle));
+        return -1;
+    }
+    LOG_INFO("sqlite: version %d ended (scanned=%d changed=%d)",
+             version, scanned_delta, changed_delta);
+    return 0;
+}
+
+int sqlite_block_mark_verified(sqlite_db_t *db, int32_t devno,
+                               int64_t offset, int version) {
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db->handle, SQL_MARK_VERIFIED, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        LOG_ERROR("sqlite_mark_verified: prepare failed: %s",
+                  sqlite3_errmsg(db->handle));
+        return -1;
+    }
+
+    sqlite3_bind_int(stmt, 1, version);
+    sqlite3_bind_int(stmt, 2, devno);
+    sqlite3_bind_int64(stmt, 3, offset);
+
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+
+    if (rc != SQLITE_DONE) {
+        LOG_ERROR("sqlite_mark_verified: step failed: %s",
+                  sqlite3_errmsg(db->handle));
+        return -1;
+    }
+    return 0;
+}
+
+int sqlite_count_unacked_v(sqlite_db_t *db, const char *remote_id,
+                           int before_version) {
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db->handle, SQL_COUNT_UNACKED_V,
+                                -1, &stmt, NULL);
+    if (rc != SQLITE_OK) return -1;
+
+    sqlite3_bind_text(stmt, 1, remote_id ? remote_id : db->remote_id,
+                      -1, SQLITE_STATIC);
+    sqlite3_bind_int(stmt, 2, before_version);
+
+    int count = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        count = sqlite3_column_int(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    return count;
+}
+
+int sqlite_get_version_history(sqlite_db_t *db, const char *remote_id,
+                               version_info_t *infos, int max_count) {
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db->handle, SQL_GET_VERSION_HISTORY,
+                                -1, &stmt, NULL);
+    if (rc != SQLITE_OK) return -1;
+
+    sqlite3_bind_text(stmt, 1, remote_id ? remote_id : db->remote_id,
+                      -1, SQLITE_STATIC);
+
+    int count = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW && count < max_count) {
+        version_info_t *v = &infos[count];
+        v->version       = sqlite3_column_int(stmt, 0);
+        v->start_time    = sqlite3_column_int64(stmt, 1);
+        v->end_time      = sqlite3_column_int64(stmt, 2);
+        v->scanned_count = sqlite3_column_int(stmt, 3);
+        v->changed_count = sqlite3_column_int(stmt, 4);
+        count++;
+    }
+    sqlite3_finalize(stmt);
+    return count;
+}
+
+int sqlite_get_version_info(sqlite_db_t *db, int version,
+                            const char *remote_id, version_info_t *info) {
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db->handle, SQL_GET_VERSION_INFO,
+                                -1, &stmt, NULL);
+    if (rc != SQLITE_OK) return -2;
+
+    sqlite3_bind_int(stmt, 1, version);
+    sqlite3_bind_text(stmt, 2, remote_id ? remote_id : db->remote_id,
+                      -1, SQLITE_STATIC);
+
+    rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+        memset(info, 0, sizeof(*info));
+        info->version       = sqlite3_column_int(stmt, 0);
+        info->start_time    = sqlite3_column_int64(stmt, 1);
+        info->end_time      = sqlite3_column_int64(stmt, 2);
+        info->scanned_count = sqlite3_column_int(stmt, 3);
+        info->changed_count = sqlite3_column_int(stmt, 4);
+        sqlite3_finalize(stmt);
+        return 0;
+    }
+
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_DONE) ? -1 : -2;
+}
+
+int sqlite_count_blocks_by_version(sqlite_db_t *db, int version,
+                                   const char *remote_id) {
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db->handle, SQL_COUNT_BLOCKS_BY_VERSION,
+                                -1, &stmt, NULL);
+    if (rc != SQLITE_OK) return -1;
+
+    sqlite3_bind_int(stmt, 1, version);
+    sqlite3_bind_text(stmt, 2, remote_id ? remote_id : db->remote_id,
                       -1, SQLITE_STATIC);
 
     int count = 0;
